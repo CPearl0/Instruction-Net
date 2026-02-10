@@ -54,7 +54,7 @@ class MultiTaskLoss(nn.Module):
         self.device = torch.device(device)
 
         self.loss_start = loss_start
-        self.msle_loss = MSLELoss()
+        self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
         self.ce_loss = nn.CrossEntropyLoss()
     
@@ -73,8 +73,8 @@ class MultiTaskLoss(nn.Module):
         icache_hit_target = target[..., self.loss_start:, 4].float()
         dcache_hit_target = target[..., self.loss_start:, 5].long()
         
-        fetch_cycle_loss = self.msle_loss(fetch_cycle_pred, fetch_cycle_target)
-        exec_cycle_loss = self.msle_loss(exec_cycle_pred, exec_cycle_target)
+        fetch_cycle_loss = self.mse_loss(fetch_cycle_pred, fetch_cycle_target)
+        exec_cycle_loss = self.mse_loss(exec_cycle_pred, exec_cycle_target)
         branch_mispredict_loss = self.bce_loss(branch_mispredict_logits, branch_mispredict_target)
         tlb_hit_loss = self.bce_loss(tlb_hit_logits, tlb_hit_target)
         icache_hit_loss = self.bce_loss(icache_hit_logits, icache_hit_target)
