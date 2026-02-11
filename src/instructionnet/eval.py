@@ -1,6 +1,7 @@
 from __future__ import annotations
-from src.tao.model import TAOModel
-from src.tao.dataset import TAODataset, OverlappingSampler, collate_fn
+from src.instructionnet.tao_model import TAOModel
+from src.instructionnet.instructionnet_model import InstructionNet
+from src.instructionnet.dataset import TAODataset, OverlappingSampler, collate_fn
 from dataclasses import dataclass
 import torch
 from torch.utils.data import DataLoader
@@ -10,8 +11,9 @@ import argparse
 @dataclass
 class EvalConfig:
     datasets: list[str]
+    name: str
 
-    hidden_dim: int = 2048
+    hidden_dim: int = 512
 
     batch_size: int = 512
     window_size: int = 128
@@ -23,7 +25,10 @@ class EvalConfig:
 @torch.no_grad()
 def eval(config: EvalConfig):
     device = torch.device(config.device)
-    model = TAOModel(config.hidden_dim).to(device)
+    if config.name == "tao":
+        model = TAOModel(config.hidden_dim).to(device)
+    else:
+        model = InstructionNet(config.hidden_dim).to(device)
     if config.load_state_file:
         checkpoint = torch.load(config.load_state_file)
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -65,6 +70,7 @@ def eval(config: EvalConfig):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--name", type=lambda s: s.lower(), choices=["tao", "inet"], default="tao")
     parser.add_argument("--dataset", type=str, nargs="+") # Support multi datasets
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--model", type=str, default="")
@@ -73,6 +79,7 @@ def main():
 
     config = EvalConfig(
         datasets=args.dataset,
+        name=args.name,
         device=args.device,
         load_state_file=args.model
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
-from src.tao.model import TAOModel
-from src.tao.dataset import TAODataset, OverlappingSampler, collate_fn
+from src.instructionnet.tao_model import TAOModel
+from src.instructionnet.instructionnet_model import InstructionNet
+from src.instructionnet.dataset import TAODataset, OverlappingSampler, collate_fn
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -15,10 +16,12 @@ from pathlib import Path
 @dataclass
 class TrainConfig:
     datasets: list[str]
+    name: str
 
-    hidden_dim: int = 2048
+    hidden_dim: int = 512
 
-    lr: float = 2e-5
+    lr: float = 1e-4
+    cycle_loss_weight: float = 1e-3
     batch_size: int = 1024
     window_size: int = 128
     max_grad_norm: float = 4.0
@@ -54,7 +57,7 @@ class MultiTaskLoss(nn.Module):
         self.device = torch.device(device)
 
         self.loss_start = loss_start
-        self.mse_loss = nn.MSELoss()
+        self.huber_loss = nn.HuberLoss(delta=5)
         self.bce_loss = nn.BCEWithLogitsLoss()
         self.ce_loss = nn.CrossEntropyLoss()
     
@@ -73,8 +76,8 @@ class MultiTaskLoss(nn.Module):
         icache_hit_target = target[..., self.loss_start:, 4].float()
         dcache_hit_target = target[..., self.loss_start:, 5].long()
         
-        fetch_cycle_loss = self.mse_loss(fetch_cycle_pred, fetch_cycle_target)
-        exec_cycle_loss = self.mse_loss(exec_cycle_pred, exec_cycle_target)
+        fetch_cycle_loss = self.huber_loss(fetch_cycle_pred, fetch_cycle_target)
+        exec_cycle_loss = self.huber_loss(exec_cycle_pred, exec_cycle_target)
         branch_mispredict_loss = self.bce_loss(branch_mispredict_logits, branch_mispredict_target)
         tlb_hit_loss = self.bce_loss(tlb_hit_logits, tlb_hit_target)
         icache_hit_loss = self.bce_loss(icache_hit_logits, icache_hit_target)
@@ -111,29 +114,30 @@ class Trainer:
         ) for dataset in self.datasets]
 
         self.device = torch.device(config.device)
-        self.model = TAOModel(config.hidden_dim).to(self.device)
+        if self.config.name == "tao":
+            self.model = TAOModel(config.hidden_dim).to(self.device)
+        else:
+            self.model = InstructionNet(config.hidden_dim).to(self.device)
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), 
                                            lr=config.lr)
         if config.load_state_file:
             self.load_checkpoint(config.load_state_file)
         self.loss = MultiTaskLoss({
-            "fetch_cycle": 0.1,
-            "exec_cycle": 0.1,
+            "fetch_cycle": config.cycle_loss_weight,
+            "exec_cycle": config.cycle_loss_weight,
             "branch_mispredict": 1.0,
             "tlb_hit": 1.0,
             "icache_hit": 1.0,
             "dcache_hit": 1.0,
         }, config.window_size, config.device)
-        experiment_name = "TAO"
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.writer = SummaryWriter(f"logs/{experiment_name}_{timestamp}")
+        self.writer = SummaryWriter(f"logs/{self.config.name}_{timestamp}")
 
     def save_checkpoint(self, file: str = ""):
         if not file:
-            experiment_name = "TAO"
             timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            file = f"model/{experiment_name}-{timestamp}.model"
+            file = f"model/{self.config.name}-{timestamp}.model"
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict()
@@ -177,8 +181,8 @@ class Trainer:
                 self.writer.add_scalar("train/loss_dcache_hit", loss["dcache_hit"].item(), batch_idx)
                 self.writer.add_scalar("train/grad_norm", grad_norm, batch_idx)
 
-            if batch_idx % 10000 == 0:
-                self.save_checkpoint("model/latest.model")
+            if batch_idx % 2500 == 0:
+                self.save_checkpoint(f"model/{self.config.name}-latest.model")
 
         # Save the final model
         self.save_checkpoint()
@@ -186,16 +190,21 @@ class Trainer:
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--name", type=lambda s: s.lower(), choices=["tao", "inet"], default="tao")
     parser.add_argument("--dataset", type=str, nargs="+") # Support multi datasets
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--model", type=str, default="")
+
+    parser.add_argument("--cycle-loss-weight", type=float, default=1e-3)
 
     args = parser.parse_args()
 
     config = TrainConfig(
         datasets=args.dataset,
+        name=args.name,
         device=args.device,
-        load_state_file=args.model
+        load_state_file=args.model,
+        cycle_loss_weight=args.cycle_loss_weight,
     )
     trainer = Trainer(config)
 
