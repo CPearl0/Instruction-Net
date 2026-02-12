@@ -39,7 +39,7 @@ def eval(config: EvalConfig):
         dataset = TAODataset(dataset_path)
         dataloader = DataLoader(
             dataset,
-            batch_sampler=OverlappingSampler(dataset, config.batch_size, config.window_size),
+            batch_sampler=OverlappingSampler(dataset, config.batch_size, config.window_size, True),
             collate_fn=collate_fn,
             num_workers=12,
             pin_memory=True
