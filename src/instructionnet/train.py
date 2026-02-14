@@ -20,8 +20,9 @@ class TrainConfig:
 
     hidden_dim: int = 512
 
+    epochs: int = 16
     lr: float = 1e-4
-    cycle_loss_weight: float = 1e-3
+    cycle_loss_weight: float = 1
     batch_size: int = 1024
     window_size: int = 128
     max_grad_norm: float = 4.0
@@ -110,8 +111,10 @@ class Trainer:
             batch_sampler=OverlappingSampler(dataset, config.batch_size, config.window_size, True),
             collate_fn=collate_fn,
             num_workers=12,
-            pin_memory=True
+            pin_memory=True,
+            persistent_workers=True
         ) for dataset in self.datasets]
+        self.length = min(len(dataloader) for dataloader in self.dataloaders)
 
         self.device = torch.device(config.device)
         if self.config.name == "tao":
@@ -121,6 +124,12 @@ class Trainer:
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), 
                                            lr=config.lr)
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            config.lr,
+            epochs=self.config.epochs,
+            steps_per_epoch=self.length
+        )
         if config.load_state_file:
             self.load_checkpoint(config.load_state_file)
         self.loss = MultiTaskLoss({
@@ -140,7 +149,8 @@ class Trainer:
             file = f"model/{self.config.name}-{timestamp}.model"
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict()
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
         }
         torch.save(checkpoint, file)
         print(f"Model saved to {file}")
@@ -149,40 +159,46 @@ class Trainer:
         checkpoint = torch.load(file)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         print(f"Model loaded from {file}")
 
     def train(self):
         print("Starting training...")
         Path("model").mkdir(parents=True, exist_ok=True)
         self.model.train()
-        union_loader = zip(*self.dataloaders)
-        length = min(len(dataloader) for dataloader in self.dataloaders)
-        pbar = tqdm(union_loader, total=length, unit="batch")
+        for epoch in range(self.config.epochs):
+            union_loader = zip(*self.dataloaders)
+            pbar = tqdm(union_loader, total=self.length, unit="batch", desc=f"Epoch {epoch + 1} / {self.config.epochs}")
+            for batch_idx, datas in enumerate(pbar):
+                global_idx = epoch * self.length + batch_idx
 
-        for batch_idx, datas in enumerate(pbar):
-            input = torch.stack([data[0] for data in datas]).to(self.device, non_blocking=True) # type: ignore
-            target = torch.stack([data[1] for data in datas]).to(self.device, non_blocking=True) # type: ignore
+                input = torch.stack([data[0] for data in datas]).to(self.device, non_blocking=True) # type: ignore
+                target = torch.stack([data[1] for data in datas]).to(self.device, non_blocking=True) # type: ignore
 
-            pred = self.model(input)
-            loss = self.loss(pred, target)
+                pred = self.model(input)
+                loss = self.loss(pred, target)
 
-            self.optimizer.zero_grad()
-            loss["total"].backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-            self.optimizer.step()
+                self.optimizer.zero_grad()
+                loss["total"].backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.optimizer.step()
+                self.scheduler.step()
 
-            if batch_idx % 50 == 0:
-                pbar.set_postfix({
-                    "loss": f"{loss['total'].item():.3g}",
-                })
-                self.writer.add_scalar("train/loss_total", loss["total"].item(), batch_idx)
-                self.writer.add_scalar("train/loss_fetch_cycle", loss["fetch_cycle"].item(), batch_idx)
-                self.writer.add_scalar("train/loss_branch_mispred", loss["branch_mispredict"].item(), batch_idx)
-                self.writer.add_scalar("train/loss_dcache_hit", loss["dcache_hit"].item(), batch_idx)
-                self.writer.add_scalar("train/grad_norm", grad_norm, batch_idx)
+                if batch_idx % 50 == 0:
+                    pbar.set_postfix({
+                        "loss": f"{loss['total'].item():.3g}",
+                    })
+                    self.writer.add_scalar("train/loss_total", loss["total"].item(), global_idx)
+                    self.writer.add_scalar("train/loss_fetch_cycle", loss["fetch_cycle"].item(), global_idx)
+                    self.writer.add_scalar("train/loss_branch_mispred", loss["branch_mispredict"].item(), global_idx)
+                    self.writer.add_scalar("train/loss_dcache_hit", loss["dcache_hit"].item(), global_idx)
+                    self.writer.add_scalar("train/grad_norm", grad_norm, global_idx)
+                    current_lr = self.optimizer.param_groups[0]["lr"]
+                    self.writer.add_scalar("train/learning_rate", current_lr, global_idx)
 
-            if batch_idx % 2500 == 0:
-                self.save_checkpoint(f"model/{self.config.name}-latest.model")
+                if batch_idx % 2500 == 0:
+                    self.save_checkpoint(f"model/{self.config.name}-latest.model")
+            self.save_checkpoint(f"model/{self.config.name}-epoch{epoch}.model")
 
         # Save the final model
         self.save_checkpoint()
@@ -195,7 +211,7 @@ def main():
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--model", type=str, default="")
 
-    parser.add_argument("--cycle-loss-weight", type=float, default=1e-3)
+    parser.add_argument("--cycle-loss-weight", type=float, default=1.0)
 
     args = parser.parse_args()
 
