@@ -210,6 +210,7 @@ def main():
     parser.add_argument("--dataset", type=str, nargs="+") # Support multi datasets
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--model", type=str, default="")
+    parser.add_argument("--epochs", type=int, default=1)
 
     parser.add_argument("--cycle-loss-weight", type=float, default=1.0)
 
@@ -220,6 +221,7 @@ def main():
         name=args.name,
         device=args.device,
         load_state_file=args.model,
+        epochs=args.epochs,
         cycle_loss_weight=args.cycle_loss_weight,
     )
     trainer = Trainer(config)
