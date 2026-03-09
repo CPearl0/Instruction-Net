@@ -21,7 +21,7 @@ class TrainConfig:
     hidden_dim: int = 512
 
     epochs: int = 16
-    lr: float = 1e-4
+    lr: float = 1e-5
     cycle_loss_weight: float = 1
     batch_size: int = 1024
     window_size: int = 128
@@ -58,7 +58,7 @@ class MultiTaskLoss(nn.Module):
         self.device = torch.device(device)
 
         self.loss_start = loss_start
-        self.huber_loss = nn.HuberLoss(delta=5)
+        self.huber_loss = nn.HuberLoss(delta=3)
         self.bce_loss = nn.BCEWithLogitsLoss()
         self.ce_loss = nn.CrossEntropyLoss()
     
@@ -134,11 +134,11 @@ class Trainer:
             self.load_checkpoint(config.load_state_file)
         self.loss = MultiTaskLoss({
             "fetch_cycle": config.cycle_loss_weight,
-            "exec_cycle": config.cycle_loss_weight,
-            "branch_mispredict": 1.0,
-            "tlb_hit": 1.0,
-            "icache_hit": 1.0,
-            "dcache_hit": 1.0,
+            "exec_cycle": 0.0, # config.cycle_loss_weight,
+            "branch_mispredict": 10.0,
+            "tlb_hit": 0.0,
+            "icache_hit": 0.0,
+            "dcache_hit": 10.0,
         }, config.window_size, config.device)
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.writer = SummaryWriter(f"logs/{self.config.name}_{timestamp}")
