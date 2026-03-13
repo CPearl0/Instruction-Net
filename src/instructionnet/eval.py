@@ -20,10 +20,13 @@ class EvalConfig:
     device: str = "cpu"
 
     load_state_file: str = ""
+    max_time_seconds: float | None = None
 
 
 @torch.no_grad()
 def eval(config: EvalConfig):
+    import time
+
     device = torch.device(config.device)
     if config.name == "tao":
         model = TAOModel(config.hidden_dim).to(device)
@@ -34,46 +37,58 @@ def eval(config: EvalConfig):
         model.load_state_dict(checkpoint["model_state_dict"])
         print(f"Model loaded from {config.load_state_file}")
     model.eval()
-    for dataset_path in config.datasets:
-        print(f"Starting evaluating {dataset_path}")
-        dataset = TAODataset(dataset_path)
-        dataloader = DataLoader(
-            dataset,
-            batch_sampler=OverlappingSampler(dataset, config.batch_size, config.window_size, True),
-            collate_fn=collate_fn,
-            num_workers=12,
-            pin_memory=True
-        )
 
-        true_cycles = 0.0
-        pred_cycles = 0.0
+    datasets = [TAODataset(f) for f in config.datasets]
+    dataloaders = [DataLoader(
+        dataset,
+        batch_sampler=OverlappingSampler(dataset, config.batch_size, config.window_size, True),
+        collate_fn=collate_fn,
+        num_workers=12,
+        pin_memory=True
+    ) for dataset in datasets]
+    length = min(len(dataloader) for dataloader in dataloaders)
 
-        pbar = tqdm(dataloader, total=len(dataloader), unit="batch")
-        for batch_idx, (input, target) in enumerate(pbar):
-            input: torch.Tensor = input.to(device, non_blocking=True)
-            target: torch.Tensor = target.to(device, non_blocking=True)
-            pred = model(input)
-            fetch_cycle_pred = pred["fetch_cycle"][..., config.window_size:]
-            fetch_cycle_target = target[..., config.window_size:, 0]
-            true_cycles += torch.sum(fetch_cycle_target).item()
-            pred_cycles += torch.sum(fetch_cycle_pred).item()
+    true_cycles = [0.0] * len(config.datasets)
+    pred_cycles = [0.0] * len(config.datasets)
 
-            if batch_idx % 50 == 0:
-                error = abs(pred_cycles - true_cycles) / true_cycles
-                pbar.set_postfix({
-                    "error": f"{error:.2%}",
-                })
+    start_time = time.time()
+    union_loader = zip(*dataloaders)
+    pbar = tqdm(union_loader, total=length, unit="batch")
+    for batch_idx, datas in enumerate(pbar):
+        if config.max_time_seconds is not None and time.time() - start_time > config.max_time_seconds:
+            pbar.close()
+            break
 
-        error = abs(pred_cycles - true_cycles) / true_cycles
-        print(f"Error: {error:.2%}")
+        input = torch.stack([data[0] for data in datas]).to(device, non_blocking=True)
+        target = torch.stack([data[1] for data in datas]).to(device, non_blocking=True)
+
+        pred = model(input)
+        fetch_cycle_pred = pred["fetch_cycle"][..., config.window_size:]
+        fetch_cycle_target = target[..., config.window_size:, 0]
+
+        for i in range(len(config.datasets)):
+            true_cycles[i] += torch.sum(fetch_cycle_target[i]).item()
+            pred_cycles[i] += torch.sum(fetch_cycle_pred[i]).item()
+
+        if batch_idx % 50 == 0:
+            errors = [(pred_cycles[i] - true_cycles[i]) / true_cycles[i] if true_cycles[i] > 0 else 0.0
+                      for i in range(len(config.datasets))]
+            avg_error = sum(errors) / len(errors) if errors else 0.0
+            pbar.set_postfix({"avg_error": f"{avg_error:+.2%}"})
+
+    print("\nEvaluation Results:")
+    for i, dataset_path in enumerate(config.datasets):
+        error = (pred_cycles[i] - true_cycles[i]) / true_cycles[i] if true_cycles[i] > 0 else 0.0
+        print(f"{dataset_path}: {error:+.2%}")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", type=lambda s: s.lower(), choices=["tao", "inet"], default="tao")
-    parser.add_argument("--dataset", type=str, nargs="+") # Support multi datasets
+    parser.add_argument("--dataset", type=str, nargs="+")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--model", type=str, default="")
+    parser.add_argument("--max-time", type=float, default=None, help="Maximum evaluation time in seconds")
 
     args = parser.parse_args()
 
@@ -81,7 +96,8 @@ def main():
         datasets=args.dataset,
         name=args.name,
         device=args.device,
-        load_state_file=args.model
+        load_state_file=args.model,
+        max_time_seconds=args.max_time
     )
     eval(config)
 
