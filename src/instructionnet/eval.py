@@ -51,6 +51,11 @@ def eval(config: EvalConfig):
     true_cycles = [0.0] * len(config.datasets)
     pred_cycles = [0.0] * len(config.datasets)
 
+    branch_correct = [0] * len(config.datasets)
+    branch_total = [0] * len(config.datasets)
+    dcache_correct = [0] * len(config.datasets)
+    dcache_total = [0] * len(config.datasets)
+
     start_time = time.time()
     union_loader = zip(*dataloaders)
     pbar = tqdm(union_loader, total=length, unit="batch")
@@ -63,12 +68,22 @@ def eval(config: EvalConfig):
         target = torch.stack([data[1] for data in datas]).to(device, non_blocking=True)
 
         pred = model(input)
-        fetch_cycle_pred = pred["fetch_cycle"][..., config.window_size:]
-        fetch_cycle_target = target[..., config.window_size:, 0]
 
         for i in range(len(config.datasets)):
-            true_cycles[i] += torch.sum(fetch_cycle_target[i]).item()
-            pred_cycles[i] += torch.sum(fetch_cycle_pred[i]).item()
+            fetch_cycle_pred = pred["fetch_cycle"][i, ..., config.window_size:]
+            fetch_cycle_target = target[i, ..., config.window_size:, 0]
+            true_cycles[i] += torch.sum(fetch_cycle_target).item()
+            pred_cycles[i] += torch.sum(fetch_cycle_pred).item()
+
+            branch_pred = pred["branch_mispred"][i, ..., config.window_size:]
+            branch_target = target[i, ..., config.window_size:, 2]
+            branch_correct[i] += (branch_pred.gt(0.5).eq(branch_target)).sum().item()
+            branch_total[i] += branch_target.numel()
+
+            dcache_pred = pred["dcache_hit"][i, ..., config.window_size:, :]
+            dcache_target = target[i, ..., config.window_size:, 5]
+            dcache_correct[i] += (dcache_pred.argmax(-1).eq(dcache_target)).sum().item()
+            dcache_total[i] += dcache_target.numel()
 
         if batch_idx % 50 == 0:
             errors = [(pred_cycles[i] - true_cycles[i]) / true_cycles[i] if true_cycles[i] > 0 else 0.0
@@ -80,6 +95,16 @@ def eval(config: EvalConfig):
     for i, dataset_path in enumerate(config.datasets):
         error = (pred_cycles[i] - true_cycles[i]) / true_cycles[i] if true_cycles[i] > 0 else 0.0
         print(f"{dataset_path}: {error:+.2%}")
+
+    print("\nBranch Prediction Accuracy:")
+    for i, dataset_path in enumerate(config.datasets):
+        acc = branch_correct[i] / branch_total[i] if branch_total[i] > 0 else 0.0
+        print(f"{dataset_path}: {acc:.2%}")
+
+    print("\nDCache Hit Level Accuracy:")
+    for i, dataset_path in enumerate(config.datasets):
+        acc = dcache_correct[i] / dcache_total[i] if dcache_total[i] > 0 else 0.0
+        print(f"{dataset_path}: {acc:.2%}")
 
 
 def main():
