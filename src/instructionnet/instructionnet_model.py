@@ -43,38 +43,68 @@ class InstructionEncoder(nn.Module):
 class MultiTaskOutputHead(nn.Module):
     """
     使用一个线性层预测所有输出：
-    1. fetch_cycle: 回归任务（直接预测）
-    2. exec_cycle: 回归任务（直接预测）
-    3. branch_mispredict: 二分类（sigmoid）
-    4. tlb_hit: 二分类（sigmoid）
-    5. dcache_hit: 4分类（softmax: L1/L2/L3/主存）
-    6. icache_hit: 二分类（sigmoid）
+    1. fetch_cycle_class: 11分类（类别0-9对应周期数1-10，类别10对应10+）
+    2. fetch_cycle_regression: 回归任务（仅当周期数>=11时使用，预测实际值）
+    3. exec_cycle_class: 11分类（类别0-9对应周期数1-10，类别10对应10+）
+    4. exec_cycle_regression: 回归任务（仅当周期数>=11时使用，预测实际值）
+    5. branch_mispredict: 二分类（sigmoid）
+    6. tlb_hit: 二分类（sigmoid）
+    7. dcache_hit: 4分类（softmax: L1/L2/L3/主存）
+    8. icache_hit: 二分类（sigmoid）
 
-    输出维度 = 1 + 1 + 1 + 1 + 4 + 1 = 9
+    输出维度 = 11 + 1 + 11 + 1 + 1 + 1 + 1 + 4 = 31
     """
     def __init__(self, input_dim):
         super().__init__()
         self.norm = nn.LayerNorm(input_dim)
-        self.out_linear = nn.Linear(input_dim, 9)
+        self.out_linear = nn.Linear(input_dim, 31)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         x = F.silu(self.norm(x))
         out = self.out_linear(x)
-        fetch_cycle = F.softplus(out[..., 0])
-        exec_cycle = F.softplus(out[..., 1])
-        branch_mispred_logits = out[..., 2]
-        tlb_hit_logits = out[..., 3]
-        icache_hit_logits = out[..., 4]
-        dcache_hit_logits = out[..., 5:9]
-        
+
+        # fetch_cycle预测：分类+回归
+        fetch_cycle_class_logits = out[..., 0:11]  # 11分类
+        fetch_cycle_regression = F.softplus(out[..., 11])  # 回归，用于10+的情况
+
+        # exec_cycle预测：分类+回归
+        exec_cycle_class_logits = out[..., 12:23]  # 11分类
+        exec_cycle_regression = F.softplus(out[..., 23])  # 回归，用于10+的情况
+
+        # 其他任务
+        branch_mispred_logits = out[..., 24]
+        tlb_hit_logits = out[..., 25]
+        icache_hit_logits = out[..., 26]
+        dcache_hit_logits = out[..., 27:31]
+
         branch_mispred = F.sigmoid(branch_mispred_logits)
         tlb_hit = F.sigmoid(tlb_hit_logits)
         icache_hit = F.sigmoid(icache_hit_logits)
         dcache_hit = F.softmax(dcache_hit_logits, dim=-1)
 
+        # 计算最终的fetch_cycle预测值
+        fetch_cycle_class_pred = fetch_cycle_class_logits.argmax(dim=-1)
+        fetch_cycle = torch.where(
+            fetch_cycle_class_pred < 10,
+            (fetch_cycle_class_pred + 1).float(),
+            fetch_cycle_regression
+        )
+
+        # 计算最终的exec_cycle预测值
+        exec_cycle_class_pred = exec_cycle_class_logits.argmax(dim=-1)
+        exec_cycle = torch.where(
+            exec_cycle_class_pred < 10,
+            (exec_cycle_class_pred + 1).float(),
+            exec_cycle_regression
+        )
+
         return {
             "fetch_cycle": fetch_cycle,
+            "fetch_cycle_class_logits": fetch_cycle_class_logits,
+            "fetch_cycle_regression": fetch_cycle_regression,
             "exec_cycle": exec_cycle,
+            "exec_cycle_class_logits": exec_cycle_class_logits,
+            "exec_cycle_regression": exec_cycle_regression,
             "branch_mispred": branch_mispred,
             "tlb_hit": tlb_hit,
             "icache_hit": icache_hit,

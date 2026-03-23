@@ -44,9 +44,11 @@ class MultiTaskLoss(nn.Module):
     """
     多任务损失函数。
 
-    处理6个预测任务：
-    - fetch_cycle: MSLE Loss (回归)
-    - exec_cycle: MSLE Loss (回归)
+    处理预测任务：
+    - fetch_cycle_class: CrossEntropy Loss (11分类: 类别0-9对应周期数1-10，类别10对应10+)
+    - fetch_cycle_regression: Huber Loss (回归，仅对真实值>=11的样本计算)
+    - exec_cycle_class: CrossEntropy Loss (11分类)
+    - exec_cycle_regression: Huber Loss (回归，仅对真实值>=11的样本计算)
     - branch_mispredict: BCE Loss (二分类)
     - tlb_hit: BCE Loss (二分类)
     - icache_hit: BCE Loss (二分类)
@@ -61,24 +63,68 @@ class MultiTaskLoss(nn.Module):
         self.huber_loss = nn.HuberLoss(delta=3)
         self.bce_loss = nn.BCEWithLogitsLoss()
         self.ce_loss = nn.CrossEntropyLoss()
-    
+        self.cycle_ce_loss = nn.CrossEntropyLoss()
+
     def forward(self, pred, target):
-        fetch_cycle_pred = pred["fetch_cycle"][..., self.loss_start:]
-        exec_cycle_pred = pred["exec_cycle"][..., self.loss_start:]
+        # fetch_cycle
+        fetch_cycle_class_logits = pred["fetch_cycle_class_logits"][..., self.loss_start:, :]
+        fetch_cycle_regression = pred["fetch_cycle_regression"][..., self.loss_start:]
+
+        # exec_cycle
+        exec_cycle_class_logits = pred["exec_cycle_class_logits"][..., self.loss_start:, :]
+        exec_cycle_regression = pred["exec_cycle_regression"][..., self.loss_start:]
+
+        # 其他任务
         branch_mispredict_logits = pred["branch_mispred_logits"][..., self.loss_start:]
         tlb_hit_logits = pred["tlb_hit_logits"][..., self.loss_start:]
         icache_hit_logits = pred["icache_hit_logits"][..., self.loss_start:]
         dcache_hit_logits = pred["dcache_hit_logits"][..., self.loss_start:, :]
-        
+
+        # 标签
         fetch_cycle_target = target[..., self.loss_start:, 0].float()
         exec_cycle_target = target[..., self.loss_start:, 1].float()
         branch_mispredict_target = target[..., self.loss_start:, 2].float()
         tlb_hit_target = target[..., self.loss_start:, 3].float()
         icache_hit_target = target[..., self.loss_start:, 4].float()
         dcache_hit_target = target[..., self.loss_start:, 5].long()
-        
-        fetch_cycle_loss = self.huber_loss(fetch_cycle_pred, fetch_cycle_target)
-        exec_cycle_loss = self.huber_loss(exec_cycle_pred, exec_cycle_target)
+
+        # fetch_cycle 分类标签: min(cycle-1, 10)
+        fetch_cycle_class_target = torch.clamp(fetch_cycle_target.long() - 1, min=0, max=10)
+
+        # fetch_cycle 分类loss：对所有样本计算
+        fetch_cycle_class_loss = self.cycle_ce_loss(
+            rearrange(fetch_cycle_class_logits, "... c -> (...) c"),
+            rearrange(fetch_cycle_class_target, "... -> (...)")
+        )
+
+        # fetch_cycle 回归loss：仅对真实值>=11的样本计算
+        fetch_high_cycle_mask = fetch_cycle_target >= 11
+        if fetch_high_cycle_mask.any():
+            fetch_cycle_regression_pred = fetch_cycle_regression[fetch_high_cycle_mask]
+            fetch_cycle_regression_target = fetch_cycle_target[fetch_high_cycle_mask]
+            fetch_cycle_regression_loss = self.huber_loss(fetch_cycle_regression_pred, fetch_cycle_regression_target)
+        else:
+            fetch_cycle_regression_loss = torch.tensor(0.0, device=self.device)
+
+        # exec_cycle 分类标签: min(cycle-1, 10)
+        exec_cycle_class_target = torch.clamp(exec_cycle_target.long() - 1, min=0, max=10)
+
+        # exec_cycle 分类loss：对所有样本计算
+        exec_cycle_class_loss = self.cycle_ce_loss(
+            rearrange(exec_cycle_class_logits, "... c -> (...) c"),
+            rearrange(exec_cycle_class_target, "... -> (...)")
+        )
+
+        # exec_cycle 回归loss：仅对真实值>=11的样本计算
+        exec_high_cycle_mask = exec_cycle_target >= 11
+        if exec_high_cycle_mask.any():
+            exec_cycle_regression_pred = exec_cycle_regression[exec_high_cycle_mask]
+            exec_cycle_regression_target = exec_cycle_target[exec_high_cycle_mask]
+            exec_cycle_regression_loss = self.huber_loss(exec_cycle_regression_pred, exec_cycle_regression_target)
+        else:
+            exec_cycle_regression_loss = torch.tensor(0.0, device=self.device)
+
+        # 其他任务loss
         branch_mispredict_loss = self.bce_loss(branch_mispredict_logits, branch_mispredict_target)
         tlb_hit_loss = self.bce_loss(tlb_hit_logits, tlb_hit_target)
         icache_hit_loss = self.bce_loss(icache_hit_logits, icache_hit_target)
@@ -88,8 +134,10 @@ class MultiTaskLoss(nn.Module):
         )
 
         loss_dict: dict[str, torch.Tensor] = {
-            "fetch_cycle": fetch_cycle_loss,
-            "exec_cycle": exec_cycle_loss,
+            "fetch_cycle_class": fetch_cycle_class_loss,
+            "fetch_cycle_regression": fetch_cycle_regression_loss,
+            "exec_cycle_class": exec_cycle_class_loss,
+            "exec_cycle_regression": exec_cycle_regression_loss,
             "branch_mispredict": branch_mispredict_loss,
             "tlb_hit": tlb_hit_loss,
             "icache_hit": icache_hit_loss,
@@ -133,8 +181,10 @@ class Trainer:
         if config.load_state_file:
             self.load_checkpoint(config.load_state_file)
         self.loss = MultiTaskLoss({
-            "fetch_cycle": config.cycle_loss_weight,
-            "exec_cycle": 0.0, # config.cycle_loss_weight,
+            "fetch_cycle_class": config.cycle_loss_weight,
+            "fetch_cycle_regression": config.cycle_loss_weight * 0.5,  # 回归loss权重稍低
+            "exec_cycle_class": 0.0,  # 暂无exec_cycle数据
+            "exec_cycle_regression": 0.0,
             "branch_mispredict": 10.0,
             "tlb_hit": 0.0,
             "icache_hit": 0.0,
@@ -189,7 +239,10 @@ class Trainer:
                         "loss": f"{loss['total'].item():.3g}",
                     })
                     self.writer.add_scalar("train/loss_total", loss["total"].item(), global_idx)
-                    self.writer.add_scalar("train/loss_fetch_cycle", loss["fetch_cycle"].item(), global_idx)
+                    self.writer.add_scalar("train/loss_fetch_cycle_class", loss["fetch_cycle_class"].item(), global_idx)
+                    self.writer.add_scalar("train/loss_fetch_cycle_regression", loss["fetch_cycle_regression"].item(), global_idx)
+                    self.writer.add_scalar("train/loss_exec_cycle_class", loss["exec_cycle_class"].item(), global_idx)
+                    self.writer.add_scalar("train/loss_exec_cycle_regression", loss["exec_cycle_regression"].item(), global_idx)
                     self.writer.add_scalar("train/loss_branch_mispred", loss["branch_mispredict"].item(), global_idx)
                     self.writer.add_scalar("train/loss_dcache_hit", loss["dcache_hit"].item(), global_idx)
                     self.writer.add_scalar("train/grad_norm", grad_norm, global_idx)
