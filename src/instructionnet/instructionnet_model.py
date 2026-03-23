@@ -10,15 +10,15 @@ class InstructionEncoder(nn.Module):
                  type_embed_dim=192,
                  reg_linear_out=192,
                  branch_linear_out=192,
-                 mem_linear_out=192):
+                 same_hist_linear_out=192):
         super().__init__()
 
         self.type_embedding = nn.Embedding(type_vocab_size, type_embed_dim)
         self.reg_linear = nn.Linear(64, reg_linear_out)
         self.branch_linear = nn.Linear(32, branch_linear_out)
-        self.mem_linear = nn.Linear(64, mem_linear_out)
+        self.same_hist_linear = nn.Linear(192, same_hist_linear_out)
 
-        concat_dim = type_embed_dim + reg_linear_out + branch_linear_out + mem_linear_out
+        concat_dim = type_embed_dim + reg_linear_out + branch_linear_out + same_hist_linear_out
         self.inst_linear = nn.Linear(concat_dim, instruction_repr_dim)
 
         self.norm = nn.LayerNorm(instruction_repr_dim)
@@ -26,14 +26,14 @@ class InstructionEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         type_feat = x[..., 0]
         reg_feat = x[..., 1:65].float()
-        mem_feat = x[..., 65:129].float()
-        branch_feat = x[..., 129:161].float()
+        same_hist_feat = x[..., 65:257].float()
+        branch_feat = x[..., 257:289].float()
 
         type_embed = self.type_embedding(type_feat)
         reg_repr = self.reg_linear(reg_feat)
         branch_repr = self.branch_linear(branch_feat)
-        mem_repr = self.mem_linear(mem_feat)
-        concat = torch.cat((type_embed, reg_repr, branch_repr, mem_repr), dim=-1)
+        same_hist_repr = self.same_hist_linear(same_hist_feat)
+        concat = torch.cat((type_embed, reg_repr, branch_repr, same_hist_repr), dim=-1)
         concat = F.silu(concat)
         inst_repr = self.inst_linear(concat)
         inst_repr = self.norm(inst_repr)
@@ -42,17 +42,16 @@ class InstructionEncoder(nn.Module):
 
 class MultiTaskOutputHead(nn.Module):
     """
-    使用一个线性层预测所有输出：
-    1. fetch_cycle_class: 11分类（类别0-9对应周期数1-10，类别10对应10+）
-    2. fetch_cycle_regression: 回归任务（仅当周期数>=11时使用，预测实际值）
-    3. exec_cycle_class: 11分类（类别0-9对应周期数1-10，类别10对应10+）
-    4. exec_cycle_regression: 回归任务（仅当周期数>=11时使用，预测实际值）
-    5. branch_mispredict: 二分类（sigmoid）
-    6. tlb_hit: 二分类（sigmoid）
-    7. dcache_hit: 4分类（softmax: L1/L2/L3/主存）
-    8. icache_hit: 二分类（sigmoid）
+    Output heads for all tasks:
+    1. fetch_cycle_class: 11 classes (class 0-9 for cycles 1-10, class 10 for 10+)
+    2. fetch_cycle_regression: regression (used when cycle >= 11)
+    3. exec_cycle_class: 11 classes
+    4. exec_cycle_regression: regression (used when cycle >= 11)
+    5. branch_mispredict: binary classification (sigmoid)
+    6. icache_hit: 3 classes (softmax: L1/L2/Memory)
+    7. dcache_hit: 3 classes (softmax: L1/L2/Memory)
 
-    输出维度 = 11 + 1 + 11 + 1 + 1 + 1 + 1 + 4 = 31
+    Output dim = 11 + 1 + 11 + 1 + 1 + 3 + 3 = 31
     """
     def __init__(self, input_dim):
         super().__init__()
@@ -63,26 +62,24 @@ class MultiTaskOutputHead(nn.Module):
         x = F.silu(self.norm(x))
         out = self.out_linear(x)
 
-        # fetch_cycle预测：分类+回归
-        fetch_cycle_class_logits = out[..., 0:11]  # 11分类
-        fetch_cycle_regression = F.softplus(out[..., 11])  # 回归，用于10+的情况
+        # fetch_cycle prediction: classification + regression
+        fetch_cycle_class_logits = out[..., 0:11]
+        fetch_cycle_regression = F.softplus(out[..., 11])
 
-        # exec_cycle预测：分类+回归
-        exec_cycle_class_logits = out[..., 12:23]  # 11分类
-        exec_cycle_regression = F.softplus(out[..., 23])  # 回归，用于10+的情况
+        # exec_cycle prediction: classification + regression
+        exec_cycle_class_logits = out[..., 12:23]
+        exec_cycle_regression = F.softplus(out[..., 23])
 
-        # 其他任务
+        # Other tasks
         branch_mispred_logits = out[..., 24]
-        tlb_hit_logits = out[..., 25]
-        icache_hit_logits = out[..., 26]
-        dcache_hit_logits = out[..., 27:31]
+        icache_hit_logits = out[..., 25:28]
+        dcache_hit_logits = out[..., 28:31]
 
         branch_mispred = F.sigmoid(branch_mispred_logits)
-        tlb_hit = F.sigmoid(tlb_hit_logits)
-        icache_hit = F.sigmoid(icache_hit_logits)
+        icache_hit = F.softmax(icache_hit_logits, dim=-1)
         dcache_hit = F.softmax(dcache_hit_logits, dim=-1)
 
-        # 计算最终的fetch_cycle预测值
+        # Compute final fetch_cycle prediction
         fetch_cycle_class_pred = fetch_cycle_class_logits.argmax(dim=-1)
         fetch_cycle = torch.where(
             fetch_cycle_class_pred < 10,
@@ -90,7 +87,7 @@ class MultiTaskOutputHead(nn.Module):
             fetch_cycle_regression
         )
 
-        # 计算最终的exec_cycle预测值
+        # Compute final exec_cycle prediction
         exec_cycle_class_pred = exec_cycle_class_logits.argmax(dim=-1)
         exec_cycle = torch.where(
             exec_cycle_class_pred < 10,
@@ -106,12 +103,10 @@ class MultiTaskOutputHead(nn.Module):
             "exec_cycle_class_logits": exec_cycle_class_logits,
             "exec_cycle_regression": exec_cycle_regression,
             "branch_mispred": branch_mispred,
-            "tlb_hit": tlb_hit,
             "icache_hit": icache_hit,
             "dcache_hit": dcache_hit,
-            # 用于loss计算
+            # For loss computation
             "branch_mispred_logits": branch_mispred_logits,
-            "tlb_hit_logits": tlb_hit_logits,
             "icache_hit_logits": icache_hit_logits,
             "dcache_hit_logits": dcache_hit_logits,
         }

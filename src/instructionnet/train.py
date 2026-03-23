@@ -42,17 +42,16 @@ class MSLELoss(nn.Module):
 
 class MultiTaskLoss(nn.Module):
     """
-    多任务损失函数。
+    Multi-task loss function.
 
-    处理预测任务：
-    - fetch_cycle_class: CrossEntropy Loss (11分类: 类别0-9对应周期数1-10，类别10对应10+)
-    - fetch_cycle_regression: Huber Loss (回归，仅对真实值>=11的样本计算)
-    - exec_cycle_class: CrossEntropy Loss (11分类)
-    - exec_cycle_regression: Huber Loss (回归，仅对真实值>=11的样本计算)
-    - branch_mispredict: BCE Loss (二分类)
-    - tlb_hit: BCE Loss (二分类)
-    - icache_hit: BCE Loss (二分类)
-    - dcache_hit: CrossEntropy Loss (4分类)
+    Tasks:
+    - fetch_cycle_class: CrossEntropy Loss (11 classes: 0-9 for cycles 1-10, 10 for 10+)
+    - fetch_cycle_regression: Huber Loss (regression, only for samples with true value >= 11)
+    - exec_cycle_class: CrossEntropy Loss (11 classes)
+    - exec_cycle_regression: Huber Loss (regression, only for samples with true value >= 11)
+    - branch_mispredict: BCE Loss (binary)
+    - icache_hit: CrossEntropy Loss (3 classes: L1/L2/Memory)
+    - dcache_hit: CrossEntropy Loss (3 classes: L1/L2/Memory)
     """
     def __init__(self, weights: dict[str, float | torch.Tensor], loss_start, device):
         super().__init__()
@@ -74,30 +73,28 @@ class MultiTaskLoss(nn.Module):
         exec_cycle_class_logits = pred["exec_cycle_class_logits"][..., self.loss_start:, :]
         exec_cycle_regression = pred["exec_cycle_regression"][..., self.loss_start:]
 
-        # 其他任务
+        # Other tasks
         branch_mispredict_logits = pred["branch_mispred_logits"][..., self.loss_start:]
-        tlb_hit_logits = pred["tlb_hit_logits"][..., self.loss_start:]
-        icache_hit_logits = pred["icache_hit_logits"][..., self.loss_start:]
+        icache_hit_logits = pred["icache_hit_logits"][..., self.loss_start:, :]
         dcache_hit_logits = pred["dcache_hit_logits"][..., self.loss_start:, :]
 
-        # 标签
+        # Labels
         fetch_cycle_target = target[..., self.loss_start:, 0].float()
         exec_cycle_target = target[..., self.loss_start:, 1].float()
         branch_mispredict_target = target[..., self.loss_start:, 2].float()
-        tlb_hit_target = target[..., self.loss_start:, 3].float()
-        icache_hit_target = target[..., self.loss_start:, 4].float()
-        dcache_hit_target = target[..., self.loss_start:, 5].long()
+        icache_hit_target = target[..., self.loss_start:, 3].long()
+        dcache_hit_target = target[..., self.loss_start:, 4].long()
 
-        # fetch_cycle 分类标签: min(cycle-1, 10)
+        # fetch_cycle class target: min(cycle-1, 10)
         fetch_cycle_class_target = torch.clamp(fetch_cycle_target.long() - 1, min=0, max=10)
 
-        # fetch_cycle 分类loss：对所有样本计算
+        # fetch_cycle class loss: compute for all samples
         fetch_cycle_class_loss = self.cycle_ce_loss(
             rearrange(fetch_cycle_class_logits, "... c -> (...) c"),
             rearrange(fetch_cycle_class_target, "... -> (...)")
         )
 
-        # fetch_cycle 回归loss：仅对真实值>=11的样本计算
+        # fetch_cycle regression loss: only for samples with true value >= 11
         fetch_high_cycle_mask = fetch_cycle_target >= 11
         if fetch_high_cycle_mask.any():
             fetch_cycle_regression_pred = fetch_cycle_regression[fetch_high_cycle_mask]
@@ -106,16 +103,16 @@ class MultiTaskLoss(nn.Module):
         else:
             fetch_cycle_regression_loss = torch.tensor(0.0, device=self.device)
 
-        # exec_cycle 分类标签: min(cycle-1, 10)
+        # exec_cycle class target: min(cycle-1, 10)
         exec_cycle_class_target = torch.clamp(exec_cycle_target.long() - 1, min=0, max=10)
 
-        # exec_cycle 分类loss：对所有样本计算
+        # exec_cycle class loss: compute for all samples
         exec_cycle_class_loss = self.cycle_ce_loss(
             rearrange(exec_cycle_class_logits, "... c -> (...) c"),
             rearrange(exec_cycle_class_target, "... -> (...)")
         )
 
-        # exec_cycle 回归loss：仅对真实值>=11的样本计算
+        # exec_cycle regression loss: only for samples with true value >= 11
         exec_high_cycle_mask = exec_cycle_target >= 11
         if exec_high_cycle_mask.any():
             exec_cycle_regression_pred = exec_cycle_regression[exec_high_cycle_mask]
@@ -124,10 +121,12 @@ class MultiTaskLoss(nn.Module):
         else:
             exec_cycle_regression_loss = torch.tensor(0.0, device=self.device)
 
-        # 其他任务loss
+        # Other task losses
         branch_mispredict_loss = self.bce_loss(branch_mispredict_logits, branch_mispredict_target)
-        tlb_hit_loss = self.bce_loss(tlb_hit_logits, tlb_hit_target)
-        icache_hit_loss = self.bce_loss(icache_hit_logits, icache_hit_target)
+        icache_hit_loss = self.ce_loss(
+            rearrange(icache_hit_logits, "... c -> (...) c"),
+            rearrange(icache_hit_target, "... -> (...)")
+        )
         dcache_hit_loss = self.ce_loss(
             rearrange(dcache_hit_logits, "... c -> (...) c"),
             rearrange(dcache_hit_target, "... -> (...)")
@@ -139,7 +138,6 @@ class MultiTaskLoss(nn.Module):
             "exec_cycle_class": exec_cycle_class_loss,
             "exec_cycle_regression": exec_cycle_regression_loss,
             "branch_mispredict": branch_mispredict_loss,
-            "tlb_hit": tlb_hit_loss,
             "icache_hit": icache_hit_loss,
             "dcache_hit": dcache_hit_loss,
         }
@@ -182,12 +180,11 @@ class Trainer:
             self.load_checkpoint(config.load_state_file)
         self.loss = MultiTaskLoss({
             "fetch_cycle_class": config.cycle_loss_weight,
-            "fetch_cycle_regression": config.cycle_loss_weight * 0.5,  # 回归loss权重稍低
-            "exec_cycle_class": 0.0,  # 暂无exec_cycle数据
+            "fetch_cycle_regression": config.cycle_loss_weight * 0.01,
+            "exec_cycle_class": 0.0,
             "exec_cycle_regression": 0.0,
             "branch_mispredict": 10.0,
-            "tlb_hit": 0.0,
-            "icache_hit": 0.0,
+            "icache_hit": 10.0,
             "dcache_hit": 10.0,
         }, config.window_size, config.device)
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -244,6 +241,7 @@ class Trainer:
                     self.writer.add_scalar("train/loss_exec_cycle_class", loss["exec_cycle_class"].item(), global_idx)
                     self.writer.add_scalar("train/loss_exec_cycle_regression", loss["exec_cycle_regression"].item(), global_idx)
                     self.writer.add_scalar("train/loss_branch_mispred", loss["branch_mispredict"].item(), global_idx)
+                    self.writer.add_scalar("train/loss_icache_hit", loss["icache_hit"].item(), global_idx)
                     self.writer.add_scalar("train/loss_dcache_hit", loss["dcache_hit"].item(), global_idx)
                     self.writer.add_scalar("train/grad_norm", grad_norm, global_idx)
                     current_lr = self.optimizer.param_groups[0]["lr"]

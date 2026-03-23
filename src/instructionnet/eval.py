@@ -39,12 +39,12 @@ def eval(config: EvalConfig):
     model.eval()
 
     datasets = [TAODataset(f) for f in config.datasets]
+    num_workers = 0 if config.device.startswith("cuda") else 4
     dataloaders = [DataLoader(
         dataset,
         batch_sampler=OverlappingSampler(dataset, config.batch_size, config.window_size, True),
         collate_fn=collate_fn,
-        num_workers=12,
-        pin_memory=True
+        num_workers=num_workers,
     ) for dataset in datasets]
     length = min(len(dataloader) for dataloader in dataloaders)
 
@@ -53,6 +53,8 @@ def eval(config: EvalConfig):
 
     branch_correct = [0] * len(config.datasets)
     branch_total = [0] * len(config.datasets)
+    icache_correct = [0] * len(config.datasets)
+    icache_total = [0] * len(config.datasets)
     dcache_correct = [0] * len(config.datasets)
     dcache_total = [0] * len(config.datasets)
 
@@ -129,8 +131,13 @@ def eval(config: EvalConfig):
             branch_correct[i] += (branch_pred.gt(0.5).eq(branch_target)).sum().item()
             branch_total[i] += branch_target.numel()
 
+            icache_pred = pred["icache_hit"][i, ..., config.window_size:, :]
+            icache_target = target[i, ..., config.window_size:, 3]
+            icache_correct[i] += (icache_pred.argmax(-1).eq(icache_target)).sum().item()
+            icache_total[i] += icache_target.numel()
+
             dcache_pred = pred["dcache_hit"][i, ..., config.window_size:, :]
-            dcache_target = target[i, ..., config.window_size:, 5]
+            dcache_target = target[i, ..., config.window_size:, 4]
             dcache_correct[i] += (dcache_pred.argmax(-1).eq(dcache_target)).sum().item()
             dcache_total[i] += dcache_target.numel()
 
@@ -177,7 +184,12 @@ def eval(config: EvalConfig):
         acc = branch_correct[i] / branch_total[i] if branch_total[i] > 0 else 0.0
         print(f"  {dataset_path}: {acc:.2%}")
 
-    print("\nDCache Hit Level Accuracy:")
+    print("\nICache Hit Level Accuracy (3 classes: L1/L2/Memory):")
+    for i, dataset_path in enumerate(config.datasets):
+        acc = icache_correct[i] / icache_total[i] if icache_total[i] > 0 else 0.0
+        print(f"  {dataset_path}: {acc:.2%}")
+
+    print("\nDCache Hit Level Accuracy (3 classes: L1/L2/Memory):")
     for i, dataset_path in enumerate(config.datasets):
         acc = dcache_correct[i] / dcache_total[i] if dcache_total[i] > 0 else 0.0
         print(f"  {dataset_path}: {acc:.2%}")
