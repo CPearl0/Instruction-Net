@@ -128,8 +128,10 @@ def eval(config: EvalConfig):
 
             branch_pred = pred["branch_mispred"][i, ..., config.window_size:]
             branch_target = target[i, ..., config.window_size:, 2]
-            branch_correct[i] += (branch_pred.gt(0.5).eq(branch_target)).sum().item()
-            branch_total[i] += branch_target.numel()
+            is_control = target[i, ..., config.window_size:, 5].bool()
+            if is_control.any():
+                branch_correct[i] += (branch_pred[is_control].gt(0.5).eq(branch_target[is_control])).sum().item()
+                branch_total[i] += is_control.sum().item()
 
             icache_pred = pred["icache_hit"][i, ..., config.window_size:, :]
             icache_target = target[i, ..., config.window_size:, 3]
@@ -138,8 +140,10 @@ def eval(config: EvalConfig):
 
             dcache_pred = pred["dcache_hit"][i, ..., config.window_size:, :]
             dcache_target = target[i, ..., config.window_size:, 4]
-            dcache_correct[i] += (dcache_pred.argmax(-1).eq(dcache_target)).sum().item()
-            dcache_total[i] += dcache_target.numel()
+            is_mem_ref = target[i, ..., config.window_size:, 6].bool()
+            if is_mem_ref.any():
+                dcache_correct[i] += (dcache_pred[is_mem_ref].argmax(-1).eq(dcache_target[is_mem_ref])).sum().item()
+                dcache_total[i] += is_mem_ref.sum().item()
 
         if batch_idx % 50 == 0:
             errors = [(pred_cycles[i] - true_cycles[i]) / true_cycles[i] if true_cycles[i] > 0 else 0.0

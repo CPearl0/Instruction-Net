@@ -87,8 +87,11 @@ def collate_fn(batch):
     branch_mispredict = torch.from_numpy(batch_np["isMispredicted"].astype(np.int32))
     icache_hit_level = torch.from_numpy(batch_np["icache_hit_level"].astype(np.int32))
     dcache_hit_level = torch.from_numpy(batch_np["dcache_hit_level"].astype(np.int32))
+    is_control = torch.from_numpy(batch_np["isControl"].astype(np.int32))
+    is_mem_ref = torch.from_numpy(batch_np["isMemRef"].astype(np.int32))
     ground_truth = torch.stack([
-        fetch_latency, exec_latency, branch_mispredict, icache_hit_level, dcache_hit_level
+        fetch_latency, exec_latency, branch_mispredict, icache_hit_level, dcache_hit_level,
+        is_control, is_mem_ref
     ], dim=1)
 
     return label, ground_truth

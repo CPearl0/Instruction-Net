@@ -21,11 +21,11 @@ class TrainConfig:
     hidden_dim: int = 512
 
     epochs: int = 16
-    lr: float = 1e-5
+    lr: float = 5e-5
     cycle_loss_weight: float = 1
     batch_size: int = 1024
     window_size: int = 128
-    max_grad_norm: float = 4.0
+    max_grad_norm: float = 5.0
     device: str = "cpu"
 
     load_state_file: str = ""
@@ -84,6 +84,8 @@ class MultiTaskLoss(nn.Module):
         branch_mispredict_target = target[..., self.loss_start:, 2].float()
         icache_hit_target = target[..., self.loss_start:, 3].long()
         dcache_hit_target = target[..., self.loss_start:, 4].long()
+        is_control = target[..., self.loss_start:, 5].bool()
+        is_mem_ref = target[..., self.loss_start:, 6].bool()
 
         # fetch_cycle class target: min(cycle-1, 10)
         fetch_cycle_class_target = torch.clamp(fetch_cycle_target.long() - 1, min=0, max=10)
@@ -122,15 +124,24 @@ class MultiTaskLoss(nn.Module):
             exec_cycle_regression_loss = torch.tensor(0.0, device=self.device)
 
         # Other task losses
-        branch_mispredict_loss = self.bce_loss(branch_mispredict_logits, branch_mispredict_target)
+        if is_control.any():
+            branch_mispredict_loss = self.bce_loss(
+                branch_mispredict_logits[is_control],
+                branch_mispredict_target[is_control]
+            )
+        else:
+            branch_mispredict_loss = torch.tensor(0.0, device=self.device)
         icache_hit_loss = self.ce_loss(
             rearrange(icache_hit_logits, "... c -> (...) c"),
             rearrange(icache_hit_target, "... -> (...)")
         )
-        dcache_hit_loss = self.ce_loss(
-            rearrange(dcache_hit_logits, "... c -> (...) c"),
-            rearrange(dcache_hit_target, "... -> (...)")
-        )
+        if is_mem_ref.any():
+            dcache_hit_loss = self.ce_loss(
+                rearrange(dcache_hit_logits[is_mem_ref], "... c -> (...) c"),
+                rearrange(dcache_hit_target[is_mem_ref], "... -> (...)")
+            )
+        else:
+            dcache_hit_loss = torch.tensor(0.0, device=self.device)
 
         loss_dict: dict[str, torch.Tensor] = {
             "fetch_cycle_class": fetch_cycle_class_loss,
@@ -181,8 +192,8 @@ class Trainer:
         self.loss = MultiTaskLoss({
             "fetch_cycle_class": config.cycle_loss_weight,
             "fetch_cycle_regression": config.cycle_loss_weight * 0.01,
-            "exec_cycle_class": 0.0,
-            "exec_cycle_regression": 0.0,
+            "exec_cycle_class": config.cycle_loss_weight,
+            "exec_cycle_regression": config.cycle_loss_weight * 0.01,
             "branch_mispredict": 10.0,
             "icache_hit": 10.0,
             "dcache_hit": 10.0,
@@ -263,7 +274,7 @@ def main():
     parser.add_argument("--model", type=str, default="")
     parser.add_argument("--epochs", type=int, default=1)
 
-    parser.add_argument("--cycle-loss-weight", type=float, default=1.0)
+    parser.add_argument("--cycle-loss-weight", type=float, default=0.1)
 
     args = parser.parse_args()
 

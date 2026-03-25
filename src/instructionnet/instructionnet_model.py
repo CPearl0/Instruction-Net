@@ -176,7 +176,7 @@ class InstructionNet(nn.Module):
         self.RoPE = RotaryEmbedding(hidden_dim // 8)
         self.layers = nn.Sequential(
             *[TransformerBlock(hidden_dim, 8, hidden_dim * 8 // 3, self.RoPE)
-              for _ in range(8)]
+              for _ in range(3)]
         )
         self.output_head = MultiTaskOutputHead(hidden_dim)
 
