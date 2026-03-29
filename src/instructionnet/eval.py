@@ -107,7 +107,7 @@ def eval(config: EvalConfig):
             if fetch_high_cycle_mask.any():
                 fetch_cycle_regression = pred["fetch_cycle_regression"][i, ..., config.window_size:]
                 fetch_high_cycle_true_sum[i] += fetch_cycle_target[fetch_high_cycle_mask].sum().item()
-                fetch_high_cycle_pred_sum[i] += fetch_cycle_regression[fetch_high_cycle_mask].sum().item()
+                fetch_high_cycle_pred_sum[i] += (fetch_cycle_regression[fetch_high_cycle_mask] * 100).sum().item()
                 fetch_high_cycle_count[i] += fetch_high_cycle_mask.sum().item()
 
             # exec_cycle 相关统计
@@ -123,7 +123,7 @@ def eval(config: EvalConfig):
             if exec_high_cycle_mask.any():
                 exec_cycle_regression = pred["exec_cycle_regression"][i, ..., config.window_size:]
                 exec_high_cycle_true_sum[i] += exec_cycle_target[exec_high_cycle_mask].sum().item()
-                exec_high_cycle_pred_sum[i] += exec_cycle_regression[exec_high_cycle_mask].sum().item()
+                exec_high_cycle_pred_sum[i] += (exec_cycle_regression[exec_high_cycle_mask] * 100).sum().item()
                 exec_high_cycle_count[i] += exec_high_cycle_mask.sum().item()
 
             branch_pred = pred["branch_mispred"][i, ..., config.window_size:]

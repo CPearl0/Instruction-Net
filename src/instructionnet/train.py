@@ -59,7 +59,7 @@ class MultiTaskLoss(nn.Module):
         self.device = torch.device(device)
 
         self.loss_start = loss_start
-        self.huber_loss = nn.HuberLoss(delta=3)
+        self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
         self.ce_loss = nn.CrossEntropyLoss()
         self.cycle_ce_loss = nn.CrossEntropyLoss()
@@ -100,8 +100,8 @@ class MultiTaskLoss(nn.Module):
         fetch_high_cycle_mask = fetch_cycle_target >= 11
         if fetch_high_cycle_mask.any():
             fetch_cycle_regression_pred = fetch_cycle_regression[fetch_high_cycle_mask]
-            fetch_cycle_regression_target = fetch_cycle_target[fetch_high_cycle_mask]
-            fetch_cycle_regression_loss = self.huber_loss(fetch_cycle_regression_pred, fetch_cycle_regression_target)
+            fetch_cycle_regression_target = fetch_cycle_target[fetch_high_cycle_mask] / 100.0
+            fetch_cycle_regression_loss = self.mse_loss(fetch_cycle_regression_pred, fetch_cycle_regression_target)
         else:
             fetch_cycle_regression_loss = torch.tensor(0.0, device=self.device)
 
@@ -118,8 +118,8 @@ class MultiTaskLoss(nn.Module):
         exec_high_cycle_mask = exec_cycle_target >= 11
         if exec_high_cycle_mask.any():
             exec_cycle_regression_pred = exec_cycle_regression[exec_high_cycle_mask]
-            exec_cycle_regression_target = exec_cycle_target[exec_high_cycle_mask]
-            exec_cycle_regression_loss = self.huber_loss(exec_cycle_regression_pred, exec_cycle_regression_target)
+            exec_cycle_regression_target = exec_cycle_target[exec_high_cycle_mask] / 100.0
+            exec_cycle_regression_loss = self.mse_loss(exec_cycle_regression_pred, exec_cycle_regression_target)
         else:
             exec_cycle_regression_loss = torch.tensor(0.0, device=self.device)
 

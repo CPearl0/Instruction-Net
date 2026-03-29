@@ -84,7 +84,7 @@ class MultiTaskOutputHead(nn.Module):
         fetch_cycle = torch.where(
             fetch_cycle_class_pred < 10,
             (fetch_cycle_class_pred + 1).float(),
-            fetch_cycle_regression
+            fetch_cycle_regression * 100
         )
 
         # Compute final exec_cycle prediction
@@ -92,7 +92,7 @@ class MultiTaskOutputHead(nn.Module):
         exec_cycle = torch.where(
             exec_cycle_class_pred < 10,
             (exec_cycle_class_pred + 1).float(),
-            exec_cycle_regression
+            exec_cycle_regression * 100
         )
 
         return {
