@@ -18,14 +18,14 @@ class TrainConfig:
     datasets: list[str]
     name: str
 
-    hidden_dim: int = 512
+    hidden_dim: int = 768
 
     epochs: int = 16
-    lr: float = 5e-5
+    lr: float = 2e-5
     cycle_loss_weight: float = 1
     batch_size: int = 1024
     window_size: int = 128
-    max_grad_norm: float = 5.0
+    max_grad_norm: float = 10.0
     device: str = "cpu"
 
     load_state_file: str = ""

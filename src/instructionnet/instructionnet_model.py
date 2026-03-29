@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from rotary_embedding_torch import RotaryEmbedding
 
+
 class InstructionEncoder(nn.Module):
     def __init__(self, instruction_repr_dim,
                  type_vocab_size=157,
@@ -18,7 +19,8 @@ class InstructionEncoder(nn.Module):
         self.branch_linear = nn.Linear(32, branch_linear_out)
         self.same_hist_linear = nn.Linear(192, same_hist_linear_out)
 
-        concat_dim = type_embed_dim + reg_linear_out + branch_linear_out + same_hist_linear_out
+        concat_dim = type_embed_dim + reg_linear_out + \
+            branch_linear_out + same_hist_linear_out
         self.inst_linear = nn.Linear(concat_dim, instruction_repr_dim)
 
         self.norm = nn.LayerNorm(instruction_repr_dim)
@@ -33,7 +35,8 @@ class InstructionEncoder(nn.Module):
         reg_repr = self.reg_linear(reg_feat)
         branch_repr = self.branch_linear(branch_feat)
         same_hist_repr = self.same_hist_linear(same_hist_feat)
-        concat = torch.cat((type_embed, reg_repr, branch_repr, same_hist_repr), dim=-1)
+        concat = torch.cat(
+            (type_embed, reg_repr, branch_repr, same_hist_repr), dim=-1)
         concat = F.silu(concat)
         inst_repr = self.inst_linear(concat)
         inst_repr = self.norm(inst_repr)
@@ -53,6 +56,7 @@ class MultiTaskOutputHead(nn.Module):
 
     Output dim = 11 + 1 + 11 + 1 + 1 + 3 + 3 = 31
     """
+
     def __init__(self, input_dim):
         super().__init__()
         self.norm = nn.LayerNorm(input_dim)
@@ -116,6 +120,7 @@ class MultiHeadSelfAttention(nn.Module):
     """
     每个指令只能关注前面128条指令（包括自身共129条）。
     """
+
     def __init__(self, embed_dim, num_heads, positional_encoder: RotaryEmbedding, window_size=128):
         super().__init__()
         assert embed_dim % num_heads == 0
@@ -131,7 +136,8 @@ class MultiHeadSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         QKV = self.qkv_proj(x)
-        QKV = rearrange(QKV, "... l (h d_k c) -> c ... h l d_k", h=self.num_heads, c=3)
+        QKV = rearrange(QKV, "... l (h d_k c) -> c ... h l d_k",
+                        h=self.num_heads, c=3)
         Q, K, V = QKV[0], QKV[1], QKV[2]
         Q = self.RoPE.rotate_queries_or_keys(Q)
         K = self.RoPE.rotate_queries_or_keys(K)
@@ -150,7 +156,7 @@ class SwiGLU(nn.Module):
         self.w1 = nn.Linear(d_model, d_ff)
         self.w2 = nn.Linear(d_ff, d_model)
         self.w3 = nn.Linear(d_model, d_ff)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
@@ -158,7 +164,8 @@ class SwiGLU(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, d_ff: int, positional_encoder: RotaryEmbedding):
         super().__init__()
-        self.attn = MultiHeadSelfAttention(d_model, num_heads, positional_encoder)
+        self.attn = MultiHeadSelfAttention(
+            d_model, num_heads, positional_encoder)
         self.ffn = SwiGLU(d_model, d_ff)
         self.norm1 = nn.RMSNorm(d_model)
         self.norm2 = nn.RMSNorm(d_model)
@@ -175,8 +182,8 @@ class InstructionNet(nn.Module):
         self.inst_encoder = InstructionEncoder(hidden_dim)
         self.RoPE = RotaryEmbedding(hidden_dim // 8)
         self.layers = nn.Sequential(
-            *[TransformerBlock(hidden_dim, 8, hidden_dim * 8 // 3, self.RoPE)
-              for _ in range(3)]
+            *[TransformerBlock(hidden_dim, 4, hidden_dim * 8 // 3, self.RoPE)
+              for _ in range(4)]
         )
         self.output_head = MultiTaskOutputHead(hidden_dim)
 

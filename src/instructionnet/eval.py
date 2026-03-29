@@ -13,7 +13,7 @@ class EvalConfig:
     datasets: list[str]
     name: str
 
-    hidden_dim: int = 512
+    hidden_dim: int = 768
 
     batch_size: int = 512
     window_size: int = 128
