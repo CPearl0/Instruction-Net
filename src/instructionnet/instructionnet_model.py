@@ -162,27 +162,28 @@ class SwiGLU(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, positional_encoder: RotaryEmbedding):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, positional_encoder: RotaryEmbedding, dropout: float = 0.1):
         super().__init__()
         self.attn = MultiHeadSelfAttention(
             d_model, num_heads, positional_encoder)
         self.ffn = SwiGLU(d_model, d_ff)
         self.norm1 = nn.RMSNorm(d_model)
         self.norm2 = nn.RMSNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attn_out = x + self.attn(self.norm1(x))
-        ffn_out = attn_out + self.ffn(self.norm2(attn_out))
+        attn_out = x + self.dropout(self.attn(self.norm1(x)))
+        ffn_out = attn_out + self.dropout(self.ffn(self.norm2(attn_out)))
         return ffn_out
 
 
 class InstructionNet(nn.Module):
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, dropout: float = 0.1):
         super().__init__()
         self.inst_encoder = InstructionEncoder(hidden_dim)
         self.RoPE = RotaryEmbedding(hidden_dim // 8)
         self.layers = nn.Sequential(
-            *[TransformerBlock(hidden_dim, 4, hidden_dim * 8 // 3, self.RoPE)
+            *[TransformerBlock(hidden_dim, 4, hidden_dim * 8 // 3, self.RoPE, dropout)
               for _ in range(4)]
         )
         self.output_head = MultiTaskOutputHead(hidden_dim)
