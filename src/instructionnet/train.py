@@ -18,7 +18,7 @@ class TrainConfig:
     datasets: list[str]
     name: str
 
-    hidden_dim: int = 768
+    hidden_dim: int = 1024
 
     epochs: int = 16
     lr: float = 1e-5
@@ -191,9 +191,9 @@ class Trainer:
             self.load_checkpoint(config.load_state_file)
         self.loss = MultiTaskLoss({
             "fetch_cycle_class": config.cycle_loss_weight,
-            "fetch_cycle_regression": config.cycle_loss_weight,
+            "fetch_cycle_regression": 5 * config.cycle_loss_weight,
             "exec_cycle_class": config.cycle_loss_weight,
-            "exec_cycle_regression": config.cycle_loss_weight,
+            "exec_cycle_regression": 5 * config.cycle_loss_weight,
             "branch_mispredict": 10.0,
             "icache_hit": 10.0,
             "dcache_hit": 10.0,

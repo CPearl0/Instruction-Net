@@ -8,7 +8,7 @@ from rotary_embedding_torch import RotaryEmbedding
 class InstructionEncoder(nn.Module):
     def __init__(self, instruction_repr_dim,
                  type_vocab_size=157,
-                 type_embed_dim=192,
+                 type_embed_dim=256,
                  reg_linear_out=192,
                  branch_linear_out=192,
                  same_hist_linear_out=192):
@@ -181,7 +181,7 @@ class InstructionNet(nn.Module):
     def __init__(self, hidden_dim, dropout: float = 0.1):
         super().__init__()
         self.inst_encoder = InstructionEncoder(hidden_dim)
-        self.RoPE = RotaryEmbedding(hidden_dim // 8)
+        self.RoPE = RotaryEmbedding(hidden_dim // 4)
         self.layers = nn.Sequential(
             *[TransformerBlock(hidden_dim, 4, hidden_dim * 8 // 3, self.RoPE, dropout)
               for _ in range(4)]
