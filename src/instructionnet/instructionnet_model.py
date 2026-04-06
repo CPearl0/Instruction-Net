@@ -11,32 +11,46 @@ class InstructionEncoder(nn.Module):
                  type_embed_dim=256,
                  reg_linear_out=192,
                  branch_linear_out=192,
-                 same_hist_linear_out=192):
+                 icache_hist_linear_out=64,
+                 dcache_hist_linear_out=64,
+                 page_hist_linear_out=64,
+                 flag_linear_out=16):
         super().__init__()
 
         self.type_embedding = nn.Embedding(type_vocab_size, type_embed_dim)
         self.reg_linear = nn.Linear(64, reg_linear_out)
         self.branch_linear = nn.Linear(32, branch_linear_out)
-        self.same_hist_linear = nn.Linear(192, same_hist_linear_out)
+        self.icache_hist_linear = nn.Linear(64, icache_hist_linear_out)
+        self.dcache_hist_linear = nn.Linear(64, dcache_hist_linear_out)
+        self.page_hist_linear = nn.Linear(64, page_hist_linear_out)
+        self.flag_linear = nn.Linear(3, flag_linear_out)
 
         concat_dim = type_embed_dim + reg_linear_out + \
-            branch_linear_out + same_hist_linear_out
+            icache_hist_linear_out + dcache_hist_linear_out + page_hist_linear_out + \
+            branch_linear_out + flag_linear_out
         self.inst_linear = nn.Linear(concat_dim, instruction_repr_dim)
 
         self.norm = nn.LayerNorm(instruction_repr_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        type_feat = x[..., 0]
+        type_feat = x[..., 0].long()
         reg_feat = x[..., 1:65].float()
-        same_hist_feat = x[..., 65:257].float()
+        icache_hist_feat = x[..., 65:129].float()
+        dcache_hist_feat = x[..., 129:193].float()
+        page_hist_feat = x[..., 193:257].float()
         branch_feat = x[..., 257:289].float()
+        flag_feat = x[..., 289:292].float()
 
         type_embed = self.type_embedding(type_feat)
         reg_repr = self.reg_linear(reg_feat)
+        icache_hist_repr = self.icache_hist_linear(icache_hist_feat)
+        dcache_hist_repr = self.dcache_hist_linear(dcache_hist_feat)
+        page_hist_repr = self.page_hist_linear(page_hist_feat)
         branch_repr = self.branch_linear(branch_feat)
-        same_hist_repr = self.same_hist_linear(same_hist_feat)
+        flag_repr = self.flag_linear(flag_feat)
         concat = torch.cat(
-            (type_embed, reg_repr, branch_repr, same_hist_repr), dim=-1)
+            (type_embed, reg_repr, icache_hist_repr, dcache_hist_repr,
+             page_hist_repr, branch_repr, flag_repr), dim=-1)
         concat = F.silu(concat)
         inst_repr = self.inst_linear(concat)
         inst_repr = self.norm(inst_repr)

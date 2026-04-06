@@ -72,6 +72,10 @@ def collate_fn(batch):
     same_page_hist_bits = (same_page_hist >> shifts64) & 1
     branch_hist_bits = (branch_hist >> shifts32) & 1
 
+    is_control_feat = torch.from_numpy(batch_np["isControl"].astype(np.float32)).unsqueeze(-1)
+    is_cond_ctrl_feat = torch.from_numpy(batch_np["isCondCtrl"].astype(np.float32)).unsqueeze(-1)
+    is_mem_ref_feat = torch.from_numpy(batch_np["isMemRef"].astype(np.float32)).unsqueeze(-1)
+
     label = torch.cat([
         types,
         int_reg_bits,
@@ -80,6 +84,9 @@ def collate_fn(batch):
         same_dcache_line_hist_bits,
         same_page_hist_bits,
         branch_hist_bits,
+        is_control_feat,
+        is_cond_ctrl_feat,
+        is_mem_ref_feat,
     ], dim=1)
 
     fetch_latency = torch.from_numpy(batch_np["fetch_latency"].astype(np.int32))

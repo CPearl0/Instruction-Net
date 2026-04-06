@@ -21,7 +21,7 @@ class TrainConfig:
     hidden_dim: int = 1024
 
     epochs: int = 16
-    lr: float = 1e-5
+    lr: float = 1e-4
     cycle_loss_weight: float = 1
     batch_size: int = 1024
     window_size: int = 16
@@ -194,9 +194,9 @@ class Trainer:
             "fetch_cycle_regression": 5 * config.cycle_loss_weight,
             "exec_cycle_class": config.cycle_loss_weight,
             "exec_cycle_regression": 5 * config.cycle_loss_weight,
-            "branch_mispredict": 10.0,
-            "icache_hit": 10.0,
-            "dcache_hit": 10.0,
+            "branch_mispredict": 1.0,
+            "icache_hit": 1.0,
+            "dcache_hit": 1.0,
         }, config.window_size, config.device)
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.writer = SummaryWriter(f"logs/{self.config.name}_{timestamp}")
@@ -274,7 +274,7 @@ def main():
     parser.add_argument("--model", type=str, default="")
     parser.add_argument("--epochs", type=int, default=1)
 
-    parser.add_argument("--cycle-loss-weight", type=float, default=0.1)
+    parser.add_argument("--cycle-loss-weight", type=float, default=1.0)
 
     args = parser.parse_args()
 
