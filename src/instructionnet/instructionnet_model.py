@@ -192,13 +192,13 @@ class TransformerBlock(nn.Module):
 
 
 class InstructionNet(nn.Module):
-    def __init__(self, hidden_dim, dropout: float = 0.1):
+    def __init__(self, hidden_dim, dropout: float = 0.2):
         super().__init__()
         self.inst_encoder = InstructionEncoder(hidden_dim)
         self.RoPE = RotaryEmbedding(hidden_dim // 4)
         self.layers = nn.Sequential(
             *[TransformerBlock(hidden_dim, 4, hidden_dim * 8 // 3, self.RoPE, dropout)
-              for _ in range(4)]
+              for _ in range(2)]
         )
         self.output_head = MultiTaskOutputHead(hidden_dim)
 

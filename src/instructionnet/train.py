@@ -18,13 +18,13 @@ class TrainConfig:
     datasets: list[str]
     name: str
 
-    hidden_dim: int = 1024
+    hidden_dim: int = 512
 
     epochs: int = 16
-    lr: float = 1e-4
+    lr: float = 3e-5
     cycle_loss_weight: float = 1
     batch_size: int = 1024
-    window_size: int = 16
+    window_size: int = 32
     max_grad_norm: float = 10.0
     device: str = "cpu"
 
@@ -179,8 +179,8 @@ class Trainer:
         else:
             self.model = InstructionNet(config.hidden_dim).to(self.device)
 
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), 
-                                           lr=config.lr)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(),
+                                           lr=config.lr, weight_decay=0.05)
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             config.lr,

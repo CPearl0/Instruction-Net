@@ -13,10 +13,10 @@ class EvalConfig:
     datasets: list[str]
     name: str
 
-    hidden_dim: int = 1024
+    hidden_dim: int = 512
 
     batch_size: int = 1024
-    window_size: int = 16
+    window_size: int = 32
     device: str = "cpu"
 
     load_state_file: str = ""
@@ -145,7 +145,7 @@ def eval(config: EvalConfig):
                 dcache_correct[i] += (dcache_pred[is_mem_ref].argmax(-1).eq(dcache_target[is_mem_ref])).sum().item()
                 dcache_total[i] += is_mem_ref.sum().item()
 
-        if batch_idx % 50 == 0:
+        if batch_idx % 5 == 0:
             errors = [(pred_cycles[i] - true_cycles[i]) / true_cycles[i] if true_cycles[i] > 0 else 0.0
                       for i in range(len(config.datasets))]
             avg_error = sum(errors) / len(errors) if errors else 0.0
