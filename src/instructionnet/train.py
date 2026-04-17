@@ -3,6 +3,7 @@ from src.instructionnet.tao_model import TAOModel
 from src.instructionnet.instructionnet_model import InstructionNet
 from src.instructionnet.dataset import TAODataset, OverlappingSampler, collate_fn
 from dataclasses import dataclass
+import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -21,7 +22,7 @@ class TrainConfig:
     hidden_dim: int = 512
 
     epochs: int = 16
-    lr: float = 3e-5
+    lr: float = 1e-4
     cycle_loss_weight: float = 1
     batch_size: int = 1024
     window_size: int = 32
@@ -181,11 +182,12 @@ class Trainer:
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(),
                                            lr=config.lr, weight_decay=0.05)
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        warmup_steps = self.length
+        total_steps = self.config.epochs * self.length
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            config.lr,
-            epochs=self.config.epochs,
-            steps_per_epoch=self.length
+            lr_lambda=lambda step: min(1.0, step / warmup_steps) *
+                0.5 * (1 + math.cos(math.pi * min(step, total_steps) / total_steps))
         )
         if config.load_state_file:
             self.load_checkpoint(config.load_state_file)
@@ -266,10 +268,16 @@ class Trainer:
         self.save_checkpoint()
 
 
+def load_datasets(path="datasets.txt"):
+    with open(path) as f:
+        return [line.strip() for line in f if line.strip()]
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--name", type=lambda s: s.lower(), choices=["tao", "inet"], default="tao")
-    parser.add_argument("--dataset", type=str, nargs="+") # Support multi datasets
+    parser.add_argument("--name", type=lambda s: s.lower(), choices=["tao", "inet"], default="inet")
+    parser.add_argument("--dataset-file", type=str, default="datasets.txt")
+    parser.add_argument("--eval-data", type=int, nargs="+", default=[])
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--model", type=str, default="")
     parser.add_argument("--epochs", type=int, default=1)
@@ -278,8 +286,13 @@ def main():
 
     args = parser.parse_args()
 
+    all_datasets = load_datasets(args.dataset_file)
+    train_datasets = [d for i, d in enumerate(all_datasets) if i not in args.eval_data]
+    print(f"Eval data: {[all_datasets[i] for i in args.eval_data]}")
+    print(f"Train data: {train_datasets}")
+
     config = TrainConfig(
-        datasets=args.dataset,
+        datasets=train_datasets,
         name=args.name,
         device=args.device,
         load_state_file=args.model,

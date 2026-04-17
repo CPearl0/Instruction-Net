@@ -199,18 +199,25 @@ def eval(config: EvalConfig):
         print(f"  {dataset_path}: {acc:.2%}")
 
 
+def load_datasets(path="datasets.txt"):
+    with open(path) as f:
+        return [line.strip() for line in f if line.strip()]
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--name", type=lambda s: s.lower(), choices=["tao", "inet"], default="tao")
-    parser.add_argument("--dataset", type=str, nargs="+")
+    parser.add_argument("--name", type=lambda s: s.lower(), choices=["tao", "inet"], default="inet")
+    parser.add_argument("--dataset-file", type=str, default="datasets.txt")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--model", type=str, default="")
     parser.add_argument("--max-time", type=float, default=None, help="Maximum evaluation time in seconds")
 
     args = parser.parse_args()
 
+    all_datasets = load_datasets(args.dataset_file)
+
     config = EvalConfig(
-        datasets=args.dataset,
+        datasets=all_datasets,
         name=args.name,
         device=args.device,
         load_state_file=args.model,
