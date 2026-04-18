@@ -18,6 +18,8 @@ class TAODataset(Dataset):
             ('fp_reg',                'u4'),
             ('branch_hist',           'u4'),
             ('isMispredicted',        'u1'),
+            ('branch_dir_wrong',      'u1'),
+            ('branch_target_wrong',   'u1'),
             ('isControl',             'u1'),
             ('isCondCtrl',            'u1'),
             ('isMemRef',              'u1'),
@@ -91,13 +93,19 @@ def collate_fn(batch):
 
     fetch_latency = torch.from_numpy(batch_np["fetch_latency"].astype(np.int32))
     exec_latency = torch.from_numpy(batch_np["exec_latency"].astype(np.int32))
-    branch_mispredict = torch.from_numpy(batch_np["isMispredicted"].astype(np.int32))
+    # Branch prediction: 0=correct, 1=direction wrong, 2=target wrong
+    branch_pred = np.where(
+        batch_np["isMispredicted"] == 0, 0,
+        np.where(batch_np["branch_target_wrong"] == 1, 2, 1)
+    ).astype(np.int32)
+    branch_pred = torch.from_numpy(branch_pred)
     icache_hit_level = torch.from_numpy(batch_np["icache_hit_level"].astype(np.int32))
     dcache_hit_level = torch.from_numpy(batch_np["dcache_hit_level"].astype(np.int32))
+    dcache_hit_level = dcache_hit_level.clamp(max=2)
     is_control = torch.from_numpy(batch_np["isControl"].astype(np.int32))
     is_mem_ref = torch.from_numpy(batch_np["isMemRef"].astype(np.int32))
     ground_truth = torch.stack([
-        fetch_latency, exec_latency, branch_mispredict, icache_hit_level, dcache_hit_level,
+        fetch_latency, exec_latency, branch_pred, icache_hit_level, dcache_hit_level,
         is_control, is_mem_ref
     ], dim=1)
 

@@ -62,19 +62,19 @@ class MultiTaskOutputHead(nn.Module):
     Output heads for all tasks:
     1. fetch_cycle_class: 11 classes (class 0-9 for cycles 1-10, class 10 for 10+)
     2. fetch_cycle_regression: regression (used when cycle >= 11)
-    3. exec_cycle_class: 11 classes
-    4. exec_cycle_regression: regression (used when cycle >= 11)
-    5. branch_mispredict: binary classification (sigmoid)
+    3. exec_cycle_class: 21 classes (class 0-19 for cycles 1-20, class 20 for 20+)
+    4. exec_cycle_regression: regression (used when cycle >= 21)
+    5. branch_predict: 3 classes (softmax: correct/dir_wrong/target_wrong)
     6. icache_hit: 3 classes (softmax: L1/L2/Memory)
     7. dcache_hit: 3 classes (softmax: L1/L2/Memory)
 
-    Output dim = 11 + 1 + 11 + 1 + 1 + 3 + 3 = 31
+    Output dim = 11 + 1 + 21 + 1 + 3 + 3 + 3 = 43
     """
 
     def __init__(self, input_dim):
         super().__init__()
         self.norm = nn.LayerNorm(input_dim)
-        self.out_linear = nn.Linear(input_dim, 31)
+        self.out_linear = nn.Linear(input_dim, 43)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         x = F.silu(self.norm(x))
@@ -85,15 +85,15 @@ class MultiTaskOutputHead(nn.Module):
         fetch_cycle_regression = F.softplus(out[..., 11])
 
         # exec_cycle prediction: classification + regression
-        exec_cycle_class_logits = out[..., 12:23]
-        exec_cycle_regression = F.softplus(out[..., 23])
+        exec_cycle_class_logits = out[..., 12:33]
+        exec_cycle_regression = F.softplus(out[..., 33])
 
         # Other tasks
-        branch_mispred_logits = out[..., 24]
-        icache_hit_logits = out[..., 25:28]
-        dcache_hit_logits = out[..., 28:31]
+        branch_mispred_logits = out[..., 34:37]
+        icache_hit_logits = out[..., 37:40]
+        dcache_hit_logits = out[..., 40:43]
 
-        branch_mispred = F.sigmoid(branch_mispred_logits)
+        branch_mispred = branch_mispred_logits.argmax(dim=-1)
         icache_hit = F.softmax(icache_hit_logits, dim=-1)
         dcache_hit = F.softmax(dcache_hit_logits, dim=-1)
 
@@ -108,7 +108,7 @@ class MultiTaskOutputHead(nn.Module):
         # Compute final exec_cycle prediction
         exec_cycle_class_pred = exec_cycle_class_logits.argmax(dim=-1)
         exec_cycle = torch.where(
-            exec_cycle_class_pred < 10,
+            exec_cycle_class_pred < 20,
             (exec_cycle_class_pred + 1).float(),
             exec_cycle_regression * 100
         )

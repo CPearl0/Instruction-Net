@@ -25,7 +25,7 @@ class TrainConfig:
     lr: float = 1e-4
     cycle_loss_weight: float = 1
     batch_size: int = 1024
-    window_size: int = 32
+    window_size: int = 128
     max_grad_norm: float = 10.0
     device: str = "cpu"
 
@@ -48,9 +48,9 @@ class MultiTaskLoss(nn.Module):
     Tasks:
     - fetch_cycle_class: CrossEntropy Loss (11 classes: 0-9 for cycles 1-10, 10 for 10+)
     - fetch_cycle_regression: Huber Loss (regression, only for samples with true value >= 11)
-    - exec_cycle_class: CrossEntropy Loss (11 classes)
-    - exec_cycle_regression: Huber Loss (regression, only for samples with true value >= 11)
-    - branch_mispredict: BCE Loss (binary)
+    - exec_cycle_class: CrossEntropy Loss (21 classes)
+    - exec_cycle_regression: Huber Loss (regression, only for samples with true value >= 21)
+    - branch_predict: CrossEntropy Loss (3 classes: correct/dir_wrong/target_wrong)
     - icache_hit: CrossEntropy Loss (3 classes: L1/L2/Memory)
     - dcache_hit: CrossEntropy Loss (3 classes: L1/L2/Memory)
     """
@@ -61,7 +61,6 @@ class MultiTaskLoss(nn.Module):
 
         self.loss_start = loss_start
         self.mse_loss = nn.MSELoss()
-        self.bce_loss = nn.BCEWithLogitsLoss()
         self.ce_loss = nn.CrossEntropyLoss()
         self.cycle_ce_loss = nn.CrossEntropyLoss()
 
@@ -75,7 +74,7 @@ class MultiTaskLoss(nn.Module):
         exec_cycle_regression = pred["exec_cycle_regression"][..., self.loss_start:]
 
         # Other tasks
-        branch_mispredict_logits = pred["branch_mispred_logits"][..., self.loss_start:]
+        branch_mispredict_logits = pred["branch_mispred_logits"][..., self.loss_start:, :]
         icache_hit_logits = pred["icache_hit_logits"][..., self.loss_start:, :]
         dcache_hit_logits = pred["dcache_hit_logits"][..., self.loss_start:, :]
 
@@ -106,8 +105,8 @@ class MultiTaskLoss(nn.Module):
         else:
             fetch_cycle_regression_loss = torch.tensor(0.0, device=self.device)
 
-        # exec_cycle class target: min(cycle-1, 10)
-        exec_cycle_class_target = torch.clamp(exec_cycle_target.long() - 1, min=0, max=10)
+        # exec_cycle class target: min(cycle-1, 20)
+        exec_cycle_class_target = torch.clamp(exec_cycle_target.long() - 1, min=0, max=20)
 
         # exec_cycle class loss: compute for all samples
         exec_cycle_class_loss = self.cycle_ce_loss(
@@ -115,8 +114,8 @@ class MultiTaskLoss(nn.Module):
             rearrange(exec_cycle_class_target, "... -> (...)")
         )
 
-        # exec_cycle regression loss: only for samples with true value >= 11
-        exec_high_cycle_mask = exec_cycle_target >= 11
+        # exec_cycle regression loss: only for samples with true value >= 21
+        exec_high_cycle_mask = exec_cycle_target >= 21
         if exec_high_cycle_mask.any():
             exec_cycle_regression_pred = exec_cycle_regression[exec_high_cycle_mask]
             exec_cycle_regression_target = exec_cycle_target[exec_high_cycle_mask] / 100.0
@@ -126,9 +125,9 @@ class MultiTaskLoss(nn.Module):
 
         # Other task losses
         if is_control.any():
-            branch_mispredict_loss = self.bce_loss(
-                branch_mispredict_logits[is_control],
-                branch_mispredict_target[is_control]
+            branch_mispredict_loss = self.ce_loss(
+                rearrange(branch_mispredict_logits[is_control], "... c -> (...) c"),
+                rearrange(branch_mispredict_target[is_control].long(), "... -> (...)")
             )
         else:
             branch_mispredict_loss = torch.tensor(0.0, device=self.device)

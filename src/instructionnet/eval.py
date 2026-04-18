@@ -16,7 +16,7 @@ class EvalConfig:
     hidden_dim: int = 512
 
     batch_size: int = 1024
-    window_size: int = 32
+    window_size: int = 128
     device: str = "cpu"
 
     load_state_file: str = ""
@@ -130,7 +130,7 @@ def eval(config: EvalConfig):
             branch_target = target[i, ..., config.window_size:, 2]
             is_control = target[i, ..., config.window_size:, 5].bool()
             if is_control.any():
-                branch_correct[i] += (branch_pred[is_control].gt(0.5).eq(branch_target[is_control])).sum().item()
+                branch_correct[i] += (branch_pred[is_control] == branch_target[is_control]).sum().item()
                 branch_total[i] += is_control.sum().item()
 
             icache_pred = pred["icache_hit"][i, ..., config.window_size:, :]

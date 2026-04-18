@@ -15,6 +15,8 @@ record_dtype = np.dtype([
     ('fp_reg',                'u4'),
     ('branch_hist',           'u4'),
     ('isMispredicted',        'u1'),
+    ('branch_dir_wrong',      'u1'),
+    ('branch_target_wrong',   'u1'),
     ('isControl',             'u1'),
     ('isCondCtrl',            'u1'),
     ('isMemRef',              'u1'),
@@ -37,11 +39,23 @@ def print_records(file_path, start, count):
 
     end = min(start + count, seq_length)
     print(f"File: {file_path}  Total instructions: {seq_length}  Showing: [{start}, {end})")
-    print(f"{'Idx':>7}  {'PC':>18}  {'Type':>4}  {'Mis':>3}  {'Class':>9}  {'fLat':>5}  {'eLat':>5}  {'iHL':>3}  {'dHL':>3}")
-    print("-" * 75)
+    print(f"{'Idx':>7}  {'PC':>18}  {'Type':>4}  {'BrPred':>5}  {'Class':>9}  {'fLat':>5}  {'eLat':>5}  {'iHL':>3}  {'dHL':>3}")
+    print("-" * 78)
 
     for i in range(start, end):
         r = data[i]
+        # Branch prediction status: ok / dir / tgt / -
+        if r['isControl']:
+            if r['isMispredicted'] == 0:
+                brpred = 'ok'
+            elif r['branch_dir_wrong']:
+                brpred = 'dir'
+            elif r['branch_target_wrong']:
+                brpred = 'tgt'
+            else:
+                brpred = 'mis'
+        else:
+            brpred = '-'
         parts = []
         if r['isCondCtrl']:
             parts.append('cctl')
@@ -55,7 +69,7 @@ def print_records(file_path, start, count):
             f"{i:>7}  "
             f"0x{r['pc']:016x}  "
             f"{r['type']:>4}  "
-            f"{r['isMispredicted']:>3}  "
+            f"{brpred:>5}  "
             f"{inst_class:>9}  "
             f"{r['fetch_latency']:>5}  "
             f"{r['exec_latency']:>5}  "
