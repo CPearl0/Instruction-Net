@@ -13,10 +13,10 @@ class EvalConfig:
     datasets: list[str]
     name: str
 
-    hidden_dim: int = 512
+    hidden_dim: int = 768
 
     batch_size: int = 1024
-    window_size: int = 128
+    window_size: int = 64
     device: str = "cpu"
 
     load_state_file: str = ""

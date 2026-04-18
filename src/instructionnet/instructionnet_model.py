@@ -11,10 +11,10 @@ class InstructionEncoder(nn.Module):
                  type_embed_dim=256,
                  reg_linear_out=192,
                  branch_linear_out=192,
-                 icache_hist_linear_out=64,
-                 dcache_hist_linear_out=64,
-                 page_hist_linear_out=64,
-                 flag_linear_out=16):
+                 icache_hist_linear_out=128,
+                 dcache_hist_linear_out=128,
+                 page_hist_linear_out=128,
+                 flag_linear_out=32):
         super().__init__()
 
         self.type_embedding = nn.Embedding(type_vocab_size, type_embed_dim)
@@ -198,7 +198,7 @@ class InstructionNet(nn.Module):
         self.RoPE = RotaryEmbedding(hidden_dim // 4)
         self.layers = nn.Sequential(
             *[TransformerBlock(hidden_dim, 4, hidden_dim * 8 // 3, self.RoPE, dropout)
-              for _ in range(2)]
+              for _ in range(3)]
         )
         self.output_head = MultiTaskOutputHead(hidden_dim)
 

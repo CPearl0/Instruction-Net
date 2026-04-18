@@ -19,13 +19,13 @@ class TrainConfig:
     datasets: list[str]
     name: str
 
-    hidden_dim: int = 512
+    hidden_dim: int = 768
 
     epochs: int = 16
-    lr: float = 1e-4
+    lr: float = 1e-3
     cycle_loss_weight: float = 1
     batch_size: int = 1024
-    window_size: int = 128
+    window_size: int = 64
     max_grad_norm: float = 10.0
     device: str = "cpu"
 
@@ -193,11 +193,11 @@ class Trainer:
         self.loss = MultiTaskLoss({
             "fetch_cycle_class": config.cycle_loss_weight,
             "fetch_cycle_regression": 5 * config.cycle_loss_weight,
-            "exec_cycle_class": config.cycle_loss_weight,
-            "exec_cycle_regression": 5 * config.cycle_loss_weight,
-            "branch_mispredict": 1.0,
-            "icache_hit": 1.0,
-            "dcache_hit": 1.0,
+            "exec_cycle_class": 0.4 * config.cycle_loss_weight,
+            "exec_cycle_regression": 2 * config.cycle_loss_weight,
+            "branch_mispredict": 2.0,
+            "icache_hit": 2.0,
+            "dcache_hit": 2.0,
         }, config.window_size, config.device)
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.writer = SummaryWriter(f"logs/{self.config.name}_{timestamp}")
