@@ -146,10 +146,10 @@ def eval(config: EvalConfig):
                 dcache_total[i] += is_mem_ref.sum().item()
 
         if batch_idx % 5 == 0:
-            errors = [(pred_cycles[i] - true_cycles[i]) / true_cycles[i] if true_cycles[i] > 0 else 0.0
+            errors = [abs((pred_cycles[i] - true_cycles[i]) / true_cycles[i]) if true_cycles[i] > 0 else 0.0
                       for i in range(len(config.datasets))]
-            avg_error = sum(errors) / len(errors) if errors else 0.0
-            pbar.set_postfix({"avg_error": f"{avg_error:+.2%}"})
+            max_error = max(errors) if errors else 0.0
+            pbar.set_postfix({"max_error": f"{max_error:.2%}"})
 
     print("\n=== Evaluation Results ===")
     print("\nFetch Cycle Count Error:")
