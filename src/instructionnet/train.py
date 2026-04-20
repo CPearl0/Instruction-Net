@@ -12,11 +12,14 @@ from einops import rearrange
 from tqdm import tqdm
 import argparse
 import datetime
+import time
 from pathlib import Path
 
 @dataclass
 class TrainConfig:
     datasets: list[str]
+    val_datasets: list[str]
+    test_datasets: list[str]
     name: str
 
     hidden_dim: int = 768
@@ -173,6 +176,14 @@ class Trainer:
         ) for dataset in self.datasets]
         self.length = min(len(dataloader) for dataloader in self.dataloaders)
 
+        # Val/Test setup
+        self.val_dataset_paths = config.val_datasets
+        self.test_dataset_paths = config.test_datasets
+        self.val_dataloaders, self.val_length = self._make_eval_dataloaders(config.val_datasets)
+        self.test_dataloaders, self.test_length = self._make_eval_dataloaders(config.test_datasets)
+        self.best_val_max_error = float('inf')
+        self.global_step = 0
+
         self.device = torch.device(config.device)
         if self.config.name == "tao":
             self.model = TAOModel(config.hidden_dim).to(self.device)
@@ -202,6 +213,53 @@ class Trainer:
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.writer = SummaryWriter(f"logs/{self.config.name}_{timestamp}")
 
+    def _make_eval_dataloaders(self, dataset_paths):
+        if not dataset_paths:
+            return [], 0
+        datasets = [TAODataset(f) for f in dataset_paths]
+        num_workers = 0 if self.config.device.startswith("cuda") else 4
+        dataloaders = [DataLoader(
+            dataset,
+            batch_sampler=OverlappingSampler(dataset, self.config.batch_size, self.config.window_size, True),
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+        ) for dataset in datasets]
+        return dataloaders, min(len(dl) for dl in dataloaders)
+
+    @torch.no_grad()
+    def _eval_on_dataloaders(self, dataloaders, length, max_time_seconds, desc):
+        self.model.eval()
+        true_cycles = [0.0] * len(dataloaders)
+        pred_cycles = [0.0] * len(dataloaders)
+
+        start = time.time()
+        union_loader = zip(*dataloaders)
+        pbar = tqdm(union_loader, total=length, unit="batch", desc=desc)
+        for batch_idx, datas in enumerate(pbar):
+            if time.time() - start > max_time_seconds:
+                pbar.close()
+                break
+
+            input = torch.stack([data[0] for data in datas]).to(self.device, non_blocking=True)
+            target = torch.stack([data[1] for data in datas]).to(self.device, non_blocking=True)
+            pred = self.model(input)
+
+            for i in range(len(dataloaders)):
+                fetch_pred = pred["fetch_cycle"][i, ..., self.config.window_size:]
+                fetch_target = target[i, ..., self.config.window_size:, 0]
+                true_cycles[i] += torch.sum(fetch_target).item()
+                pred_cycles[i] += torch.sum(fetch_pred).item()
+
+            if batch_idx % 5 == 0:
+                errors = [abs((pred_cycles[i] - true_cycles[i]) / true_cycles[i]) if true_cycles[i] > 0 else 0.0
+                          for i in range(len(dataloaders))]
+                pbar.set_postfix({"max_error": f"{max(errors):.2%}"})
+
+        self.model.train()
+        errors = [abs((pred_cycles[i] - true_cycles[i]) / true_cycles[i]) if true_cycles[i] > 0 else 0.0
+                  for i in range(len(dataloaders))]
+        return max(errors) if errors else float('inf'), errors
+
     def save_checkpoint(self, file: str = ""):
         if not file:
             timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -213,6 +271,32 @@ class Trainer:
         }
         torch.save(checkpoint, file)
         print(f"Model saved to {file}")
+
+        if self.val_dataloaders or self.test_dataloaders:
+            val_max_error, test_max_error = self.eval_quick()
+            if val_max_error < self.best_val_max_error:
+                self.best_val_max_error = val_max_error
+                best_path = f"model/{self.config.name}-best.model"
+                torch.save(checkpoint, best_path)
+                print(f"New best model! Val max error: {val_max_error:.2%} -> {best_path}")
+            self.writer.add_scalar("eval/val_max_error", val_max_error, self.global_step)
+            self.writer.add_scalar("eval/test_max_error", test_max_error, self.global_step)
+
+    def eval_quick(self, max_time_seconds=120):
+        val_max_error, test_max_error = float('inf'), float('inf')
+        if self.val_dataloaders:
+            val_max_error, val_errors = self._eval_on_dataloaders(
+                self.val_dataloaders, self.val_length, max_time_seconds, "Val Eval")
+            print(f"\nVal max abs error: {val_max_error:.2%}")
+            for i, path in enumerate(self.val_dataset_paths):
+                print(f"  {path}: {val_errors[i]:.2%}")
+        if self.test_dataloaders:
+            test_max_error, test_errors = self._eval_on_dataloaders(
+                self.test_dataloaders, self.test_length, max_time_seconds, "Test Eval")
+            print(f"\nTest max abs error: {test_max_error:.2%}")
+            for i, path in enumerate(self.test_dataset_paths):
+                print(f"  {path}: {test_errors[i]:.2%}")
+        return val_max_error, test_max_error
 
     def load_checkpoint(self, file: str):
         checkpoint = torch.load(file)
@@ -230,6 +314,7 @@ class Trainer:
             pbar = tqdm(union_loader, total=self.length, unit="batch", desc=f"Epoch {epoch + 1} / {self.config.epochs}")
             for batch_idx, datas in enumerate(pbar):
                 global_idx = epoch * self.length + batch_idx
+                self.global_step = global_idx
 
                 input = torch.stack([data[0] for data in datas]).to(self.device, non_blocking=True) # type: ignore
                 target = torch.stack([data[1] for data in datas]).to(self.device, non_blocking=True) # type: ignore
@@ -276,26 +361,36 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", type=lambda s: s.lower(), choices=["tao", "inet"], default="inet")
     parser.add_argument("--dataset-file", type=str, default="datasets.txt")
-    parser.add_argument("--eval-data", type=int, nargs="+", default=[])
+    parser.add_argument("--val-data", type=int, nargs="+", default=[])
+    parser.add_argument("--test-data", type=int, nargs="+", default=[])
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--model", type=str, default="")
     parser.add_argument("--epochs", type=int, default=1)
 
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--cycle-loss-weight", type=float, default=1.0)
 
     args = parser.parse_args()
 
     all_datasets = load_datasets(args.dataset_file)
-    train_datasets = [d for i, d in enumerate(all_datasets) if i not in args.eval_data]
-    print(f"Eval data: {[all_datasets[i] for i in args.eval_data]}")
+    val_indices = set(args.val_data)
+    test_indices = set(args.test_data)
+    train_datasets = [d for i, d in enumerate(all_datasets) if i not in val_indices and i not in test_indices]
+    val_datasets = [all_datasets[i] for i in args.val_data]
+    test_datasets = [all_datasets[i] for i in args.test_data]
+    print(f"Val data: {val_datasets}")
+    print(f"Test data: {test_datasets}")
     print(f"Train data: {train_datasets}")
 
     config = TrainConfig(
         datasets=train_datasets,
+        val_datasets=val_datasets,
+        test_datasets=test_datasets,
         name=args.name,
         device=args.device,
         load_state_file=args.model,
         epochs=args.epochs,
+        lr=args.lr,
         cycle_loss_weight=args.cycle_loss_weight,
     )
     trainer = Trainer(config)

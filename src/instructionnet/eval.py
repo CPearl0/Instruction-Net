@@ -114,12 +114,12 @@ def eval(config: EvalConfig):
             exec_cycle_target = target[i, ..., config.window_size:, 1]
             exec_cycle_class_logits = pred["exec_cycle_class_logits"][i, ..., config.window_size:, :]
             exec_cycle_class_pred = exec_cycle_class_logits.argmax(dim=-1)
-            exec_cycle_class_target = torch.clamp(exec_cycle_target.long() - 1, min=0, max=10)
+            exec_cycle_class_target = torch.clamp(exec_cycle_target.long() - 1, min=0, max=20)
             exec_cycle_class_correct[i] += (exec_cycle_class_pred == exec_cycle_class_target).sum().item()
             exec_cycle_class_total[i] += exec_cycle_class_target.numel()
 
             # exec_cycle 高周期样本(>=11)的回归误差
-            exec_high_cycle_mask = exec_cycle_target >= 11
+            exec_high_cycle_mask = exec_cycle_target >= 21
             if exec_high_cycle_mask.any():
                 exec_cycle_regression = pred["exec_cycle_regression"][i, ..., config.window_size:]
                 exec_high_cycle_true_sum[i] += exec_cycle_target[exec_high_cycle_mask].sum().item()
@@ -170,12 +170,12 @@ def eval(config: EvalConfig):
         else:
             print(f"  {dataset_path}: N/A (no high cycle samples)")
 
-    print("\nExec Cycle Classification Accuracy (11 classes: 1-10 and 10+):")
+    print("\nExec Cycle Classification Accuracy (21 classes: 1-20 and 20+):")
     for i, dataset_path in enumerate(config.datasets):
         acc = exec_cycle_class_correct[i] / exec_cycle_class_total[i] if exec_cycle_class_total[i] > 0 else 0.0
         print(f"  {dataset_path}: {acc:.2%}")
 
-    print("\nExec Cycle High Cycle (>=11) Regression Error:")
+    print("\nExec Cycle High Cycle (>=21) Regression Error:")
     for i, dataset_path in enumerate(config.datasets):
         if exec_high_cycle_count[i] > 0:
             error = (exec_high_cycle_pred_sum[i] - exec_high_cycle_true_sum[i]) / exec_high_cycle_true_sum[i]
