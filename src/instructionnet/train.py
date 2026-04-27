@@ -27,8 +27,9 @@ class TrainConfig:
     epochs: int = 16
     lr: float = 1e-3
     cycle_loss_weight: float = 1
-    batch_size: int = 1024
-    window_size: int = 64
+    seq_len: int = 1024
+    batch_size: int = 1
+    window_size: int = 8
     max_grad_norm: float = 10.0
     device: str = "cpu"
 
@@ -168,7 +169,7 @@ class Trainer:
         self.datasets = [TAODataset(f) for f in config.datasets]
         self.dataloaders = [DataLoader(
             dataset,
-            batch_sampler=OverlappingSampler(dataset, config.batch_size, config.window_size, True),
+            batch_sampler=OverlappingSampler(dataset, config.seq_len, config.window_size, config.batch_size, True),
             collate_fn=collate_fn,
             num_workers=12,
             pin_memory=True,
@@ -203,9 +204,9 @@ class Trainer:
             self.load_checkpoint(config.load_state_file)
         self.loss = MultiTaskLoss({
             "fetch_cycle_class": config.cycle_loss_weight,
-            "fetch_cycle_regression": 5 * config.cycle_loss_weight,
+            "fetch_cycle_regression": 40 * config.cycle_loss_weight,
             "exec_cycle_class": 0.4 * config.cycle_loss_weight,
-            "exec_cycle_regression": 2 * config.cycle_loss_weight,
+            "exec_cycle_regression": 16 * config.cycle_loss_weight,
             "branch_mispredict": 2.0,
             "icache_hit": 2.0,
             "dcache_hit": 2.0,
@@ -220,7 +221,7 @@ class Trainer:
         num_workers = 0 if self.config.device.startswith("cuda") else 4
         dataloaders = [DataLoader(
             dataset,
-            batch_sampler=OverlappingSampler(dataset, self.config.batch_size, self.config.window_size, True),
+            batch_sampler=OverlappingSampler(dataset, self.config.seq_len, self.config.window_size, self.config.batch_size, True),
             collate_fn=collate_fn,
             num_workers=num_workers,
         ) for dataset in datasets]
@@ -235,24 +236,30 @@ class Trainer:
         start = time.time()
         union_loader = zip(*dataloaders)
         pbar = tqdm(union_loader, total=length, unit="batch", desc=desc)
+        nd = len(dataloaders)
+        bs = self.config.batch_size
         for batch_idx, datas in enumerate(pbar):
             if time.time() - start > max_time_seconds:
                 pbar.close()
                 break
 
-            input = torch.stack([data[0] for data in datas]).to(self.device, non_blocking=True)
-            target = torch.stack([data[1] for data in datas]).to(self.device, non_blocking=True)
+            inputs = torch.stack([data[0] for data in datas])
+            targets = torch.stack([data[1] for data in datas])
+            input = inputs.reshape(nd * bs, self.config.seq_len, -1).to(self.device, non_blocking=True)
+            target = targets.reshape(nd * bs, self.config.seq_len, -1).to(self.device, non_blocking=True)
             pred = self.model(input)
 
-            for i in range(len(dataloaders)):
-                fetch_pred = pred["fetch_cycle"][i, ..., self.config.window_size:]
-                fetch_target = target[i, ..., self.config.window_size:, 0]
-                true_cycles[i] += torch.sum(fetch_target).item()
-                pred_cycles[i] += torch.sum(fetch_pred).item()
+            for i in range(nd):
+                for j in range(bs):
+                    idx = i * bs + j
+                    fetch_pred = pred["fetch_cycle"][idx, ..., self.config.window_size:]
+                    fetch_target = target[idx, ..., self.config.window_size:, 0]
+                    true_cycles[i] += torch.sum(fetch_target).item()
+                    pred_cycles[i] += torch.sum(fetch_pred).item()
 
             if batch_idx % 5 == 0:
                 errors = [abs((pred_cycles[i] - true_cycles[i]) / true_cycles[i]) if true_cycles[i] > 0 else 0.0
-                          for i in range(len(dataloaders))]
+                          for i in range(nd)]
                 pbar.set_postfix({"max_error": f"{max(errors):.2%}"})
 
         self.model.train()
@@ -282,7 +289,7 @@ class Trainer:
             self.writer.add_scalar("eval/val_max_error", val_max_error, self.global_step)
             self.writer.add_scalar("eval/test_max_error", test_max_error, self.global_step)
 
-    def eval_quick(self, max_time_seconds=120):
+    def eval_quick(self, max_time_seconds=30):
         val_max_error, test_max_error = float('inf'), float('inf')
         if self.val_dataloaders:
             val_max_error, val_errors = self._eval_on_dataloaders(
@@ -302,7 +309,6 @@ class Trainer:
         checkpoint = torch.load(file)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         print(f"Model loaded from {file}")
 
     def train(self):
@@ -316,8 +322,12 @@ class Trainer:
                 global_idx = epoch * self.length + batch_idx
                 self.global_step = global_idx
 
-                input = torch.stack([data[0] for data in datas]).to(self.device, non_blocking=True) # type: ignore
-                target = torch.stack([data[1] for data in datas]).to(self.device, non_blocking=True) # type: ignore
+                inputs = torch.stack([data[0] for data in datas])
+                targets = torch.stack([data[1] for data in datas])
+                nd = inputs.size(0)
+                bs = inputs.size(1) // self.config.seq_len
+                input = inputs.reshape(nd * bs, self.config.seq_len, -1).to(self.device, non_blocking=True)
+                target = targets.reshape(nd * bs, self.config.seq_len, -1).to(self.device, non_blocking=True)
 
                 pred = self.model(input)
                 loss = self.loss(pred, target)
@@ -361,6 +371,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", type=lambda s: s.lower(), choices=["tao", "inet"], default="inet")
     parser.add_argument("--dataset-file", type=str, default="datasets.txt")
+    parser.add_argument("--train-data", type=int, nargs="+", default=[])
     parser.add_argument("--val-data", type=int, nargs="+", default=[])
     parser.add_argument("--test-data", type=int, nargs="+", default=[])
     parser.add_argument("--device", type=str, default="cpu")
@@ -369,13 +380,17 @@ def main():
 
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--cycle-loss-weight", type=float, default=1.0)
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=1)
 
     args = parser.parse_args()
 
     all_datasets = load_datasets(args.dataset_file)
-    val_indices = set(args.val_data)
-    test_indices = set(args.test_data)
-    train_datasets = [d for i, d in enumerate(all_datasets) if i not in val_indices and i not in test_indices]
+    if args.train_data:
+        train_datasets = [all_datasets[i] for i in args.train_data]
+    else:
+        val_test_indices = set(args.val_data) | set(args.test_data)
+        train_datasets = [d for i, d in enumerate(all_datasets) if i not in val_test_indices]
     val_datasets = [all_datasets[i] for i in args.val_data]
     test_datasets = [all_datasets[i] for i in args.test_data]
     print(f"Val data: {val_datasets}")
@@ -392,6 +407,8 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         cycle_loss_weight=args.cycle_loss_weight,
+        seq_len=args.seq_len,
+        batch_size=args.batch_size,
     )
     trainer = Trainer(config)
 

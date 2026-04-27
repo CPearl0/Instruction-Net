@@ -113,22 +113,28 @@ def collate_fn(batch):
 
 
 class OverlappingSampler(Sampler):
-    def __init__(self, data_source, batch_size, overlap, shuffle: bool = False):
-        self.len = len(data_source)
-        self.batch_size = batch_size
+    def __init__(self, data_source, seq_len, overlap, batch_size=1, shuffle: bool = False):
+        self.dataset_len = len(data_source)
+        self.seq_len = seq_len
         self.overlap = overlap
-        self.stride = batch_size - overlap
+        self.stride = seq_len - overlap
+        self.batch_size = batch_size
         self.shuffle = shuffle
+        self.num_sequences = (self.dataset_len - self.overlap) // self.stride
 
     def __len__(self):
-        return (self.len - self.overlap) // self.stride
+        return self.num_sequences // self.batch_size
 
     def __iter__(self):
         if self.shuffle:
-            shuffled_indices = torch.randperm(len(self))
-            for index in shuffled_indices:
-                start = index * self.stride
-                yield range(start, start + self.batch_size)
+            seq_indices = torch.randperm(self.num_sequences)
         else:
-            for start in range(0, self.len - self.batch_size + 1, self.stride):
-                yield range(start, start + self.batch_size)
+            seq_indices = torch.arange(self.num_sequences)
+        num_batches = self.num_sequences // self.batch_size
+        for i in range(num_batches):
+            batch_seq = seq_indices[i * self.batch_size:(i + 1) * self.batch_size]
+            flat = []
+            for idx in batch_seq:
+                start = idx.item() * self.stride
+                flat.extend(range(start, start + self.seq_len))
+            yield flat

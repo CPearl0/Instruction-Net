@@ -74,11 +74,14 @@ class MultiTaskOutputHead(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
         self.norm = nn.LayerNorm(input_dim)
-        self.out_linear = nn.Linear(input_dim, 43)
+        self.out_linear1 = nn.Linear(input_dim, 256)
+        self.out_linear2 = nn.Linear(256, 43)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         x = F.silu(self.norm(x))
-        out = self.out_linear(x)
+        out = self.out_linear1(x)
+        out = F.silu(out)
+        out = self.out_linear2(out)
 
         # fetch_cycle prediction: classification + regression
         fetch_cycle_class_logits = out[..., 0:11]
