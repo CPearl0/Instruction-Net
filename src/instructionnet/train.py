@@ -1,11 +1,13 @@
 from __future__ import annotations
-from src.instructionnet.tao_model import TAOModel
-from src.instructionnet.instructionnet_model import InstructionNet
+from src.instructionnet.instructionnet_model import (
+    InstructionNet, BranchPredictor, ICachePredictor, DCachePredictor, build_main_input,
+)
 from src.instructionnet.dataset import TAODataset, OverlappingSampler, collate_fn
 from dataclasses import dataclass
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from einops import rearrange
@@ -15,14 +17,14 @@ import datetime
 import time
 from pathlib import Path
 
+
 @dataclass
 class TrainConfig:
     datasets: list[str]
     val_datasets: list[str]
     test_datasets: list[str]
-    name: str
 
-    hidden_dim: int = 768
+    hidden_dim: int = 512
 
     epochs: int = 16
     lr: float = 1e-3
@@ -36,131 +38,81 @@ class TrainConfig:
     load_state_file: str = ""
 
 
-class MSLELoss(nn.Module):
-    def __init__(self):
+class ComponentLoss(nn.Module):
+    def __init__(self, loss_start, device):
         super().__init__()
-        self.mse = nn.MSELoss()
-    
-    def forward(self, pred, true):
-        return self.mse(torch.log1p(pred), torch.log1p(true))
-
-
-class MultiTaskLoss(nn.Module):
-    """
-    Multi-task loss function.
-
-    Tasks:
-    - fetch_cycle_class: CrossEntropy Loss (11 classes: 0-9 for cycles 1-10, 10 for 10+)
-    - fetch_cycle_regression: Huber Loss (regression, only for samples with true value >= 11)
-    - exec_cycle_class: CrossEntropy Loss (21 classes)
-    - exec_cycle_regression: Huber Loss (regression, only for samples with true value >= 21)
-    - branch_predict: CrossEntropy Loss (3 classes: correct/dir_wrong/target_wrong)
-    - icache_hit: CrossEntropy Loss (3 classes: L1/L2/Memory)
-    - dcache_hit: CrossEntropy Loss (3 classes: L1/L2/Memory)
-    """
-    def __init__(self, weights: dict[str, float | torch.Tensor], loss_start, device):
-        super().__init__()
-        self.weights = weights
-        self.device = torch.device(device)
-
         self.loss_start = loss_start
-        self.mse_loss = nn.MSELoss()
-        self.ce_loss = nn.CrossEntropyLoss()
-        self.cycle_ce_loss = nn.CrossEntropyLoss()
+        self.device = torch.device(device)
+        d = self.device
+        self.branch_ce = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 4.5, 8.0], device=d))
+        self.icache_ce = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 1.5, 8.0], device=d))
+        self.dcache_ce = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 7.0, 17.0], device=d))
+
+    def forward(self, branch_logits, icache_logits, dcache_logits, target):
+        s = self.loss_start
+
+        branch_target = target[..., s:, 2].float()
+        icache_target = target[..., s:, 3].long()
+        dcache_target = target[..., s:, 4].long()
+        is_control = target[..., s:, 5].bool()
+        is_mem_ref = target[..., s:, 6].bool()
+
+        if is_control.any():
+            branch_loss = self.branch_ce(
+                rearrange(branch_logits[..., s:, :][is_control], "... c -> (...) c"),
+                rearrange(branch_target[is_control].long(), "... -> (...)"))
+        else:
+            branch_loss = torch.tensor(0.0, device=self.device)
+
+        icache_loss = self.icache_ce(
+            rearrange(icache_logits[..., s:, :], "... c -> (...) c"),
+            rearrange(icache_target, "... -> (...)"))
+
+        if is_mem_ref.any():
+            dcache_loss = self.dcache_ce(
+                rearrange(dcache_logits[..., s:, :][is_mem_ref], "... c -> (...) c"),
+                rearrange(dcache_target[is_mem_ref], "... -> (...)"))
+        else:
+            dcache_loss = torch.tensor(0.0, device=self.device)
+
+        loss_dict = {
+            "branch": branch_loss,
+            "icache": icache_loss,
+            "dcache": dcache_loss,
+            "total": branch_loss + icache_loss + dcache_loss,
+        }
+        return loss_dict
+
+
+class LatencyLoss(nn.Module):
+    def __init__(self, loss_start, device):
+        super().__init__()
+        self.loss_start = loss_start
+        self.device = torch.device(device)
+        self.huber = nn.HuberLoss()
 
     def forward(self, pred, target):
-        # fetch_cycle
-        fetch_cycle_class_logits = pred["fetch_cycle_class_logits"][..., self.loss_start:, :]
-        fetch_cycle_regression = pred["fetch_cycle_regression"][..., self.loss_start:]
-
-        # exec_cycle
-        exec_cycle_class_logits = pred["exec_cycle_class_logits"][..., self.loss_start:, :]
-        exec_cycle_regression = pred["exec_cycle_regression"][..., self.loss_start:]
-
-        # Other tasks
-        branch_mispredict_logits = pred["branch_mispred_logits"][..., self.loss_start:, :]
-        icache_hit_logits = pred["icache_hit_logits"][..., self.loss_start:, :]
-        dcache_hit_logits = pred["dcache_hit_logits"][..., self.loss_start:, :]
-
-        # Labels
-        fetch_cycle_target = target[..., self.loss_start:, 0].float()
-        exec_cycle_target = target[..., self.loss_start:, 1].float()
-        branch_mispredict_target = target[..., self.loss_start:, 2].float()
-        icache_hit_target = target[..., self.loss_start:, 3].long()
-        dcache_hit_target = target[..., self.loss_start:, 4].long()
-        is_control = target[..., self.loss_start:, 5].bool()
-        is_mem_ref = target[..., self.loss_start:, 6].bool()
-
-        # fetch_cycle class target: min(cycle-1, 10)
-        fetch_cycle_class_target = torch.clamp(fetch_cycle_target.long() - 1, min=0, max=10)
-
-        # fetch_cycle class loss: compute for all samples
-        fetch_cycle_class_loss = self.cycle_ce_loss(
-            rearrange(fetch_cycle_class_logits, "... c -> (...) c"),
-            rearrange(fetch_cycle_class_target, "... -> (...)")
-        )
-
-        # fetch_cycle regression loss: only for samples with true value >= 11
-        fetch_high_cycle_mask = fetch_cycle_target >= 11
-        if fetch_high_cycle_mask.any():
-            fetch_cycle_regression_pred = fetch_cycle_regression[fetch_high_cycle_mask]
-            fetch_cycle_regression_target = fetch_cycle_target[fetch_high_cycle_mask] / 100.0
-            fetch_cycle_regression_loss = self.mse_loss(fetch_cycle_regression_pred, fetch_cycle_regression_target)
-        else:
-            fetch_cycle_regression_loss = torch.tensor(0.0, device=self.device)
-
-        # exec_cycle class target: min(cycle-1, 20)
-        exec_cycle_class_target = torch.clamp(exec_cycle_target.long() - 1, min=0, max=20)
-
-        # exec_cycle class loss: compute for all samples
-        exec_cycle_class_loss = self.cycle_ce_loss(
-            rearrange(exec_cycle_class_logits, "... c -> (...) c"),
-            rearrange(exec_cycle_class_target, "... -> (...)")
-        )
-
-        # exec_cycle regression loss: only for samples with true value >= 21
-        exec_high_cycle_mask = exec_cycle_target >= 21
-        if exec_high_cycle_mask.any():
-            exec_cycle_regression_pred = exec_cycle_regression[exec_high_cycle_mask]
-            exec_cycle_regression_target = exec_cycle_target[exec_high_cycle_mask] / 100.0
-            exec_cycle_regression_loss = self.mse_loss(exec_cycle_regression_pred, exec_cycle_regression_target)
-        else:
-            exec_cycle_regression_loss = torch.tensor(0.0, device=self.device)
-
-        # Other task losses
-        if is_control.any():
-            branch_mispredict_loss = self.ce_loss(
-                rearrange(branch_mispredict_logits[is_control], "... c -> (...) c"),
-                rearrange(branch_mispredict_target[is_control].long(), "... -> (...)")
-            )
-        else:
-            branch_mispredict_loss = torch.tensor(0.0, device=self.device)
-        icache_hit_loss = self.ce_loss(
-            rearrange(icache_hit_logits, "... c -> (...) c"),
-            rearrange(icache_hit_target, "... -> (...)")
-        )
-        if is_mem_ref.any():
-            dcache_hit_loss = self.ce_loss(
-                rearrange(dcache_hit_logits[is_mem_ref], "... c -> (...) c"),
-                rearrange(dcache_hit_target[is_mem_ref], "... -> (...)")
-            )
-        else:
-            dcache_hit_loss = torch.tensor(0.0, device=self.device)
-
-        loss_dict: dict[str, torch.Tensor] = {
-            "fetch_cycle_class": fetch_cycle_class_loss,
-            "fetch_cycle_regression": fetch_cycle_regression_loss,
-            "exec_cycle_class": exec_cycle_class_loss,
-            "exec_cycle_regression": exec_cycle_regression_loss,
-            "branch_mispredict": branch_mispredict_loss,
-            "icache_hit": icache_hit_loss,
-            "dcache_hit": dcache_hit_loss,
+        s = self.loss_start
+        target_avg = target[..., s:, 0].float().mean(dim=-1)  # (batch,)
+        pred_avg = pred["fetch_cycle_avg"]  # (batch,)
+        fetch_loss = self.huber(pred_avg, target_avg)
+        return {
+            "fetch": fetch_loss,
+            "total": fetch_loss,
         }
-        total_loss = torch.tensor(0.0, device=self.device)
-        for name, loss in loss_dict.items():
-            total_loss += self.weights[name] * loss
-        loss_dict["total"] = total_loss
-        return loss_dict
+
+
+def _stack_component_inputs(datas):
+    keys = datas[0][0].keys()
+    stacked = {}
+    for key in keys:
+        stacked[key] = torch.stack([data[0][key] for data in datas])
+    return stacked
+
+
+def _make_lr_lambda(warmup_steps, total_steps):
+    return lambda step: min(1.0, step / warmup_steps) * \
+        0.5 * (1 + math.cos(math.pi * min(step, total_steps) / total_steps))
 
 
 class Trainer:
@@ -177,7 +129,6 @@ class Trainer:
         ) for dataset in self.datasets]
         self.length = min(len(dataloader) for dataloader in self.dataloaders)
 
-        # Val/Test setup
         self.val_dataset_paths = config.val_datasets
         self.test_dataset_paths = config.test_datasets
         self.val_dataloaders, self.val_length = self._make_eval_dataloaders(config.val_datasets)
@@ -186,33 +137,34 @@ class Trainer:
         self.global_step = 0
 
         self.device = torch.device(config.device)
-        if self.config.name == "tao":
-            self.model = TAOModel(config.hidden_dim).to(self.device)
-        else:
-            self.model = InstructionNet(config.hidden_dim).to(self.device)
 
-        self.optimizer = torch.optim.AdamW(self.model.parameters(),
-                                           lr=config.lr, weight_decay=0.05)
+        # Component models
+        self.branch_predictor = BranchPredictor().to(self.device)
+        self.icache_predictor = ICachePredictor().to(self.device)
+        self.dcache_predictor = DCachePredictor().to(self.device)
+        # Main model
+        self.main_model = InstructionNet(config.hidden_dim).to(self.device)
+
+        comp_params = (list(self.branch_predictor.parameters()) +
+                       list(self.icache_predictor.parameters()) +
+                       list(self.dcache_predictor.parameters()))
+        self.comp_optimizer = torch.optim.AdamW(comp_params, lr=config.lr, weight_decay=0.05)
+        self.main_optimizer = torch.optim.AdamW(self.main_model.parameters(), lr=config.lr, weight_decay=0.05)
+
         warmup_steps = self.length
-        total_steps = self.config.epochs * self.length
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer,
-            lr_lambda=lambda step: min(1.0, step / warmup_steps) *
-                0.5 * (1 + math.cos(math.pi * min(step, total_steps) / total_steps))
-        )
+        total_steps = config.epochs * self.length
+        lr_lambda = _make_lr_lambda(warmup_steps, total_steps)
+        self.comp_scheduler = torch.optim.lr_scheduler.LambdaLR(self.comp_optimizer, lr_lambda=lr_lambda)
+        self.main_scheduler = torch.optim.lr_scheduler.LambdaLR(self.main_optimizer, lr_lambda=lr_lambda)
+
         if config.load_state_file:
             self.load_checkpoint(config.load_state_file)
-        self.loss = MultiTaskLoss({
-            "fetch_cycle_class": config.cycle_loss_weight,
-            "fetch_cycle_regression": 40 * config.cycle_loss_weight,
-            "exec_cycle_class": 0.4 * config.cycle_loss_weight,
-            "exec_cycle_regression": 16 * config.cycle_loss_weight,
-            "branch_mispredict": 2.0,
-            "icache_hit": 2.0,
-            "dcache_hit": 2.0,
-        }, config.window_size, config.device)
+
+        self.comp_loss = ComponentLoss(config.window_size, config.device)
+        self.latency_loss = LatencyLoss(config.window_size, config.device)
+
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.writer = SummaryWriter(f"logs/{self.config.name}_{timestamp}")
+        self.writer = SummaryWriter(f"logs/inet_{timestamp}")
 
     def _make_eval_dataloaders(self, dataset_paths):
         if not dataset_paths:
@@ -227,9 +179,41 @@ class Trainer:
         ) for dataset in datasets]
         return dataloaders, min(len(dl) for dl in dataloaders)
 
+    def _move_component_inputs(self, component_inputs, nd, bs):
+        result = {}
+        for key, val in component_inputs.items():
+            val = val.reshape(nd * bs, self.config.seq_len, -1)
+            result[key] = val.to(self.device, non_blocking=True)
+        return result
+
+    @torch.no_grad()
+    def _inference(self, component_inputs):
+        branch_logits = self.branch_predictor(component_inputs["branch_hist"])
+        icache_logits = self.icache_predictor(component_inputs["icache_hist"])
+        dcache_logits = self.dcache_predictor(component_inputs["dcache_hist"], component_inputs["page_hist"])
+
+        branch_onehot = F.one_hot(branch_logits.argmax(-1), 3).float()
+        icache_onehot = F.one_hot(icache_logits.argmax(-1), 3).float()
+        dcache_onehot = F.one_hot(dcache_logits.argmax(-1), 3).float()
+
+        main_input = build_main_input(
+            component_inputs["type_reg_flags"], branch_onehot, icache_onehot, dcache_onehot)
+        main_pred = self.main_model(main_input, self.config.window_size)
+
+        return {
+            **main_pred,
+            "branch_mispred": branch_logits.argmax(-1),
+            "icache_hit": F.softmax(icache_logits, dim=-1),
+            "dcache_hit": F.softmax(dcache_logits, dim=-1),
+        }
+
     @torch.no_grad()
     def _eval_on_dataloaders(self, dataloaders, length, max_time_seconds, desc):
-        self.model.eval()
+        self.branch_predictor.eval()
+        self.icache_predictor.eval()
+        self.dcache_predictor.eval()
+        self.main_model.eval()
+
         true_cycles = [0.0] * len(dataloaders)
         pred_cycles = [0.0] * len(dataloaders)
 
@@ -243,26 +227,29 @@ class Trainer:
                 pbar.close()
                 break
 
-            inputs = torch.stack([data[0] for data in datas])
+            component_inputs = _stack_component_inputs(datas)
             targets = torch.stack([data[1] for data in datas])
-            input = inputs.reshape(nd * bs, self.config.seq_len, -1).to(self.device, non_blocking=True)
+            component_inputs = self._move_component_inputs(component_inputs, nd, bs)
             target = targets.reshape(nd * bs, self.config.seq_len, -1).to(self.device, non_blocking=True)
-            pred = self.model(input)
+            pred = self._inference(component_inputs)
 
             for i in range(nd):
                 for j in range(bs):
                     idx = i * bs + j
-                    fetch_pred = pred["fetch_cycle"][idx, ..., self.config.window_size:]
                     fetch_target = target[idx, ..., self.config.window_size:, 0]
                     true_cycles[i] += torch.sum(fetch_target).item()
-                    pred_cycles[i] += torch.sum(fetch_pred).item()
+                    pred_cycles[i] += (pred["fetch_cycle_avg"][idx] * pred["eff_len"]).item()
 
             if batch_idx % 5 == 0:
                 errors = [abs((pred_cycles[i] - true_cycles[i]) / true_cycles[i]) if true_cycles[i] > 0 else 0.0
                           for i in range(nd)]
                 pbar.set_postfix({"max_error": f"{max(errors):.2%}"})
 
-        self.model.train()
+        self.branch_predictor.train()
+        self.icache_predictor.train()
+        self.dcache_predictor.train()
+        self.main_model.train()
+
         errors = [abs((pred_cycles[i] - true_cycles[i]) / true_cycles[i]) if true_cycles[i] > 0 else 0.0
                   for i in range(len(dataloaders))]
         return max(errors) if errors else float('inf'), errors
@@ -270,11 +257,16 @@ class Trainer:
     def save_checkpoint(self, file: str = ""):
         if not file:
             timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            file = f"model/{self.config.name}-{timestamp}.model"
+            file = f"model/inet-{timestamp}.model"
         checkpoint = {
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
+            "branch_predictor": self.branch_predictor.state_dict(),
+            "icache_predictor": self.icache_predictor.state_dict(),
+            "dcache_predictor": self.dcache_predictor.state_dict(),
+            "main_model": self.main_model.state_dict(),
+            "comp_optimizer": self.comp_optimizer.state_dict(),
+            "main_optimizer": self.main_optimizer.state_dict(),
+            "comp_scheduler": self.comp_scheduler.state_dict(),
+            "main_scheduler": self.main_scheduler.state_dict(),
         }
         torch.save(checkpoint, file)
         print(f"Model saved to {file}")
@@ -283,7 +275,7 @@ class Trainer:
             val_max_error, test_max_error = self.eval_quick()
             if val_max_error < self.best_val_max_error:
                 self.best_val_max_error = val_max_error
-                best_path = f"model/{self.config.name}-best.model"
+                best_path = "model/inet-best.model"
                 torch.save(checkpoint, best_path)
                 print(f"New best model! Val max error: {val_max_error:.2%} -> {best_path}")
             self.writer.add_scalar("eval/val_max_error", val_max_error, self.global_step)
@@ -307,14 +299,25 @@ class Trainer:
 
     def load_checkpoint(self, file: str):
         checkpoint = torch.load(file)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.branch_predictor.load_state_dict(checkpoint["branch_predictor"])
+        self.icache_predictor.load_state_dict(checkpoint["icache_predictor"])
+        self.dcache_predictor.load_state_dict(checkpoint["dcache_predictor"])
+        self.main_model.load_state_dict(checkpoint["main_model"])
+        self.comp_optimizer.load_state_dict(checkpoint["comp_optimizer"])
+        self.main_optimizer.load_state_dict(checkpoint["main_optimizer"])
+        if "comp_scheduler" in checkpoint:
+            self.comp_scheduler.load_state_dict(checkpoint["comp_scheduler"])
+            self.main_scheduler.load_state_dict(checkpoint["main_scheduler"])
         print(f"Model loaded from {file}")
 
     def train(self):
         print("Starting training...")
         Path("model").mkdir(parents=True, exist_ok=True)
-        self.model.train()
+        self.branch_predictor.train()
+        self.icache_predictor.train()
+        self.dcache_predictor.train()
+        self.main_model.train()
+
         for epoch in range(self.config.epochs):
             union_loader = zip(*self.dataloaders)
             pbar = tqdm(union_loader, total=self.length, unit="batch", desc=f"Epoch {epoch + 1} / {self.config.epochs}")
@@ -322,43 +325,64 @@ class Trainer:
                 global_idx = epoch * self.length + batch_idx
                 self.global_step = global_idx
 
-                inputs = torch.stack([data[0] for data in datas])
+                component_inputs = _stack_component_inputs(datas)
                 targets = torch.stack([data[1] for data in datas])
-                nd = inputs.size(0)
-                bs = inputs.size(1) // self.config.seq_len
-                input = inputs.reshape(nd * bs, self.config.seq_len, -1).to(self.device, non_blocking=True)
+                nd = len(datas)
+                bs = component_inputs["branch_hist"].size(1) // self.config.seq_len
+                component_inputs = self._move_component_inputs(component_inputs, nd, bs)
                 target = targets.reshape(nd * bs, self.config.seq_len, -1).to(self.device, non_blocking=True)
 
-                pred = self.model(input)
-                loss = self.loss(pred, target)
+                # --- Train component models ---
+                branch_logits = self.branch_predictor(component_inputs["branch_hist"])
+                icache_logits = self.icache_predictor(component_inputs["icache_hist"])
+                dcache_logits = self.dcache_predictor(component_inputs["dcache_hist"], component_inputs["page_hist"])
 
-                self.optimizer.zero_grad()
-                loss["total"].backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-                self.optimizer.step()
-                self.scheduler.step()
+                comp_loss = self.comp_loss(branch_logits, icache_logits, dcache_logits, target)
+                self.comp_optimizer.zero_grad()
+                comp_loss["total"].backward()
+                comp_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    list(self.branch_predictor.parameters()) +
+                    list(self.icache_predictor.parameters()) +
+                    list(self.dcache_predictor.parameters()),
+                    self.config.max_grad_norm)
+                self.comp_optimizer.step()
+                self.comp_scheduler.step()
+
+                # --- Train main model with GT ---
+                with torch.no_grad():
+                    branch_onehot = F.one_hot(target[..., 2].long(), num_classes=3).float()
+                    icache_onehot = F.one_hot(target[..., 3].long(), num_classes=3).float()
+                    dcache_onehot = F.one_hot(target[..., 4].long().clamp(max=2), num_classes=3).float()
+                main_input = build_main_input(
+                    component_inputs["type_reg_flags"], branch_onehot, icache_onehot, dcache_onehot)
+
+                main_pred = self.main_model(main_input, self.config.window_size)
+                main_loss = self.latency_loss(main_pred, target)
+                self.main_optimizer.zero_grad()
+                main_loss["total"].backward()
+                main_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.main_model.parameters(), self.config.max_grad_norm)
+                self.main_optimizer.step()
+                self.main_scheduler.step()
 
                 if batch_idx % 50 == 0:
-                    pbar.set_postfix({
-                        "loss": f"{loss['total'].item():.3g}",
-                    })
-                    self.writer.add_scalar("train/loss_total", loss["total"].item(), global_idx)
-                    self.writer.add_scalar("train/loss_fetch_cycle_class", loss["fetch_cycle_class"].item(), global_idx)
-                    self.writer.add_scalar("train/loss_fetch_cycle_regression", loss["fetch_cycle_regression"].item(), global_idx)
-                    self.writer.add_scalar("train/loss_exec_cycle_class", loss["exec_cycle_class"].item(), global_idx)
-                    self.writer.add_scalar("train/loss_exec_cycle_regression", loss["exec_cycle_regression"].item(), global_idx)
-                    self.writer.add_scalar("train/loss_branch_mispred", loss["branch_mispredict"].item(), global_idx)
-                    self.writer.add_scalar("train/loss_icache_hit", loss["icache_hit"].item(), global_idx)
-                    self.writer.add_scalar("train/loss_dcache_hit", loss["dcache_hit"].item(), global_idx)
-                    self.writer.add_scalar("train/grad_norm", grad_norm, global_idx)
-                    current_lr = self.optimizer.param_groups[0]["lr"]
+                    total_loss = comp_loss["total"].item() + main_loss["total"].item()
+                    pbar.set_postfix({"loss": f"{total_loss:.3g}"})
+                    self.writer.add_scalar("train/comp_loss_total", comp_loss["total"].item(), global_idx)
+                    self.writer.add_scalar("train/comp_loss_branch", comp_loss["branch"].item(), global_idx)
+                    self.writer.add_scalar("train/comp_loss_icache", comp_loss["icache"].item(), global_idx)
+                    self.writer.add_scalar("train/comp_loss_dcache", comp_loss["dcache"].item(), global_idx)
+                    self.writer.add_scalar("train/main_loss_total", main_loss["total"].item(), global_idx)
+                    self.writer.add_scalar("train/main_loss_fetch", main_loss["fetch"].item(), global_idx)
+                    self.writer.add_scalar("train/comp_grad_norm", comp_grad_norm, global_idx)
+                    self.writer.add_scalar("train/main_grad_norm", main_grad_norm, global_idx)
+                    current_lr = self.comp_optimizer.param_groups[0]["lr"]
                     self.writer.add_scalar("train/learning_rate", current_lr, global_idx)
 
-                if batch_idx % 2500 == 0:
-                    self.save_checkpoint(f"model/{self.config.name}-latest.model")
-            self.save_checkpoint(f"model/{self.config.name}-epoch{epoch}.model")
+                if batch_idx % 2500 == 0 and global_idx > 0:
+                    self.save_checkpoint("model/inet-latest.model")
+            self.save_checkpoint(f"model/inet-epoch{epoch}.model")
 
-        # Save the final model
         self.save_checkpoint()
 
 
@@ -369,7 +393,6 @@ def load_datasets(path="datasets.txt"):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--name", type=lambda s: s.lower(), choices=["tao", "inet"], default="inet")
     parser.add_argument("--dataset-file", type=str, default="datasets.txt")
     parser.add_argument("--train-data", type=int, nargs="+", default=[])
     parser.add_argument("--val-data", type=int, nargs="+", default=[])
@@ -377,7 +400,6 @@ def main():
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--model", type=str, default="")
     parser.add_argument("--epochs", type=int, default=1)
-
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--cycle-loss-weight", type=float, default=1.0)
     parser.add_argument("--seq-len", type=int, default=1024)
@@ -401,7 +423,6 @@ def main():
         datasets=train_datasets,
         val_datasets=val_datasets,
         test_datasets=test_datasets,
-        name=args.name,
         device=args.device,
         load_state_file=args.model,
         epochs=args.epochs,
@@ -411,7 +432,6 @@ def main():
         batch_size=args.batch_size,
     )
     trainer = Trainer(config)
-
     trainer.train()
 
 

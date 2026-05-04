@@ -36,7 +36,7 @@ class TAODataset(Dataset):
 
         if not os.path.exists(file_path):
             raise FileNotFoundError
-        
+
         header = np.fromfile(file_path, dtype=self.header_dtype, count=1)
         self.seq_length = int(header[0]["seq_length"])
         self.data_mmap = np.memmap(
@@ -46,10 +46,10 @@ class TAODataset(Dataset):
             offset=8,
             shape=(self.seq_length,)
         )
-    
+
     def __len__(self):
         return self.seq_length
-    
+
     def __getitem__(self, index):
         record = self.data_mmap[index]
         return record
@@ -78,19 +78,17 @@ def collate_fn(batch):
     is_cond_ctrl_feat = torch.from_numpy(batch_np["isCondCtrl"].astype(np.float32)).unsqueeze(-1)
     is_mem_ref_feat = torch.from_numpy(batch_np["isMemRef"].astype(np.float32)).unsqueeze(-1)
 
-    label = torch.cat([
+    # type_reg_flags: type(1) + int_reg(32) + fp_reg(32) + isControl(1) + isCondCtrl(1) + isMemRef(1) = 68
+    type_reg_flags = torch.cat([
         types,
         int_reg_bits,
         fp_reg_bits,
-        same_icache_line_hist_bits,
-        same_dcache_line_hist_bits,
-        same_page_hist_bits,
-        branch_hist_bits,
         is_control_feat,
         is_cond_ctrl_feat,
         is_mem_ref_feat,
     ], dim=1)
 
+    # Labels
     fetch_latency = torch.from_numpy(batch_np["fetch_latency"].astype(np.int32))
     exec_latency = torch.from_numpy(batch_np["exec_latency"].astype(np.int32))
     # Branch prediction: 0=correct, 1=direction wrong, 2=target wrong
@@ -109,7 +107,15 @@ def collate_fn(batch):
         is_control, is_mem_ref
     ], dim=1)
 
-    return label, ground_truth
+    component_inputs = {
+        "branch_hist": branch_hist_bits.float(),
+        "icache_hist": same_icache_line_hist_bits.float(),
+        "dcache_hist": same_dcache_line_hist_bits.float(),
+        "page_hist": same_page_hist_bits.float(),
+        "type_reg_flags": type_reg_flags.float(),
+    }
+
+    return component_inputs, ground_truth
 
 
 class OverlappingSampler(Sampler):

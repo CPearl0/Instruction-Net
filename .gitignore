@@ -1,5 +1,6 @@
 data
 logs
+old-logs
 model
 claude.md
 datasets.txt

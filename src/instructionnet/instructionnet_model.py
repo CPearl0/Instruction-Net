@@ -5,139 +5,120 @@ from einops import rearrange
 from rotary_embedding_torch import RotaryEmbedding
 
 
+class BranchPredictor(nn.Module):
+    def __init__(self, hist_dim=32, hidden_dim=256, num_classes=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hist_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class ICachePredictor(nn.Module):
+    def __init__(self, hist_dim=64, hidden_dim=256, num_classes=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hist_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class DCachePredictor(nn.Module):
+    def __init__(self, dcache_hist_dim=64, page_hist_dim=64, hidden_dim=256, num_classes=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dcache_hist_dim + page_hist_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, dcache_hist: torch.Tensor, page_hist: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([dcache_hist, page_hist], dim=-1))
+
+
+def build_main_input(type_reg_flags, branch_onehot, icache_onehot, dcache_onehot):
+    return torch.cat([type_reg_flags, branch_onehot, icache_onehot, dcache_onehot], dim=-1)
+
+
 class InstructionEncoder(nn.Module):
     def __init__(self, instruction_repr_dim,
                  type_vocab_size=157,
                  type_embed_dim=256,
                  reg_linear_out=192,
-                 branch_linear_out=192,
-                 icache_hist_linear_out=128,
-                 dcache_hist_linear_out=128,
-                 page_hist_linear_out=128,
                  flag_linear_out=32):
         super().__init__()
 
         self.type_embedding = nn.Embedding(type_vocab_size, type_embed_dim)
         self.reg_linear = nn.Linear(64, reg_linear_out)
-        self.branch_linear = nn.Linear(32, branch_linear_out)
-        self.icache_hist_linear = nn.Linear(64, icache_hist_linear_out)
-        self.dcache_hist_linear = nn.Linear(64, dcache_hist_linear_out)
-        self.page_hist_linear = nn.Linear(64, page_hist_linear_out)
         self.flag_linear = nn.Linear(3, flag_linear_out)
 
-        concat_dim = type_embed_dim + reg_linear_out + \
-            icache_hist_linear_out + dcache_hist_linear_out + page_hist_linear_out + \
-            branch_linear_out + flag_linear_out
+        # type(256) + reg(192) + branch_onehot(3) + icache_onehot(3) + dcache_onehot(3) + flags(32) = 489
+        concat_dim = type_embed_dim + reg_linear_out + 3 + 3 + 3 + flag_linear_out
         self.inst_linear = nn.Linear(concat_dim, instruction_repr_dim)
 
         self.norm = nn.LayerNorm(instruction_repr_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x layout: type(1) + reg(64) + branch_oh(3) + icache_oh(3) + dcache_oh(3) + flags(3) = 77
         type_feat = x[..., 0].long()
         reg_feat = x[..., 1:65].float()
-        icache_hist_feat = x[..., 65:129].float()
-        dcache_hist_feat = x[..., 129:193].float()
-        page_hist_feat = x[..., 193:257].float()
-        branch_feat = x[..., 257:289].float()
-        flag_feat = x[..., 289:292].float()
+        branch_feat = x[..., 65:68].float()
+        icache_feat = x[..., 68:71].float()
+        dcache_feat = x[..., 71:74].float()
+        flag_feat = x[..., 74:77].float()
 
         type_embed = self.type_embedding(type_feat)
         reg_repr = self.reg_linear(reg_feat)
-        icache_hist_repr = self.icache_hist_linear(icache_hist_feat)
-        dcache_hist_repr = self.dcache_hist_linear(dcache_hist_feat)
-        page_hist_repr = self.page_hist_linear(page_hist_feat)
-        branch_repr = self.branch_linear(branch_feat)
         flag_repr = self.flag_linear(flag_feat)
         concat = torch.cat(
-            (type_embed, reg_repr, icache_hist_repr, dcache_hist_repr,
-             page_hist_repr, branch_repr, flag_repr), dim=-1)
+            (type_embed, reg_repr, branch_feat, icache_feat,
+             dcache_feat, flag_repr), dim=-1)
         concat = F.silu(concat)
         inst_repr = self.inst_linear(concat)
         inst_repr = self.norm(inst_repr)
         return F.silu(inst_repr)
 
 
-class MultiTaskOutputHead(nn.Module):
-    """
-    Output heads for all tasks:
-    1. fetch_cycle_class: 11 classes (class 0-9 for cycles 1-10, class 10 for 10+)
-    2. fetch_cycle_regression: regression (used when cycle >= 11)
-    3. exec_cycle_class: 21 classes (class 0-19 for cycles 1-20, class 20 for 20+)
-    4. exec_cycle_regression: regression (used when cycle >= 21)
-    5. branch_predict: 3 classes (softmax: correct/dir_wrong/target_wrong)
-    6. icache_hit: 3 classes (softmax: L1/L2/Memory)
-    7. dcache_hit: 3 classes (softmax: L1/L2/Memory)
-
-    Output dim = 11 + 1 + 21 + 1 + 3 + 3 + 3 = 43
-    """
+class WindowTotalOutputHead(nn.Module):
+    """Predicts total fetch cycles for the effective window via pooling."""
 
     def __init__(self, input_dim):
         super().__init__()
         self.norm = nn.LayerNorm(input_dim)
-        self.out_linear1 = nn.Linear(input_dim, 256)
-        self.out_linear2 = nn.Linear(256, 43)
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.fc2 = nn.Linear(256, 1)
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        x = F.silu(self.norm(x))
-        out = self.out_linear1(x)
-        out = F.silu(out)
-        out = self.out_linear2(out)
-
-        # fetch_cycle prediction: classification + regression
-        fetch_cycle_class_logits = out[..., 0:11]
-        fetch_cycle_regression = F.softplus(out[..., 11])
-
-        # exec_cycle prediction: classification + regression
-        exec_cycle_class_logits = out[..., 12:33]
-        exec_cycle_regression = F.softplus(out[..., 33])
-
-        # Other tasks
-        branch_mispred_logits = out[..., 34:37]
-        icache_hit_logits = out[..., 37:40]
-        dcache_hit_logits = out[..., 40:43]
-
-        branch_mispred = branch_mispred_logits.argmax(dim=-1)
-        icache_hit = F.softmax(icache_hit_logits, dim=-1)
-        dcache_hit = F.softmax(dcache_hit_logits, dim=-1)
-
-        # Compute final fetch_cycle prediction
-        fetch_cycle_class_pred = fetch_cycle_class_logits.argmax(dim=-1)
-        fetch_cycle = torch.where(
-            fetch_cycle_class_pred < 10,
-            (fetch_cycle_class_pred + 1).float(),
-            fetch_cycle_regression * 100
-        )
-
-        # Compute final exec_cycle prediction
-        exec_cycle_class_pred = exec_cycle_class_logits.argmax(dim=-1)
-        exec_cycle = torch.where(
-            exec_cycle_class_pred < 20,
-            (exec_cycle_class_pred + 1).float(),
-            exec_cycle_regression * 100
-        )
-
-        return {
-            "fetch_cycle": fetch_cycle,
-            "fetch_cycle_class_logits": fetch_cycle_class_logits,
-            "fetch_cycle_regression": fetch_cycle_regression,
-            "exec_cycle": exec_cycle,
-            "exec_cycle_class_logits": exec_cycle_class_logits,
-            "exec_cycle_regression": exec_cycle_regression,
-            "branch_mispred": branch_mispred,
-            "icache_hit": icache_hit,
-            "dcache_hit": dcache_hit,
-            # For loss computation
-            "branch_mispred_logits": branch_mispred_logits,
-            "icache_hit_logits": icache_hit_logits,
-            "dcache_hit_logits": dcache_hit_logits,
-        }
+    def forward(self, x: torch.Tensor, loss_start: int = 8) -> dict[str, torch.Tensor]:
+        effective = x[:, loss_start:]  # (batch, eff_len, input_dim)
+        eff_len = effective.shape[1]
+        pooled = effective.mean(dim=1)  # (batch, input_dim)
+        out = F.silu(self.norm(pooled))
+        out = F.silu(self.fc1(out))
+        avg = F.softplus(self.fc2(out)).squeeze(-1)  # (batch,) avg cycles per instruction
+        return {"fetch_cycle_avg": avg, "eff_len": eff_len}
 
 
 class MultiHeadSelfAttention(nn.Module):
-    """
-    每个指令只能关注前面128条指令（包括自身共129条）。
-    """
-
     def __init__(self, embed_dim, num_heads, positional_encoder: RotaryEmbedding, window_size=128):
         super().__init__()
         assert embed_dim % num_heads == 0
@@ -195,6 +176,7 @@ class TransformerBlock(nn.Module):
 
 
 class InstructionNet(nn.Module):
+    """Main model: predicts total fetch latency for a window of instructions."""
     def __init__(self, hidden_dim, dropout: float = 0.2):
         super().__init__()
         self.inst_encoder = InstructionEncoder(hidden_dim)
@@ -203,9 +185,9 @@ class InstructionNet(nn.Module):
             *[TransformerBlock(hidden_dim, 4, hidden_dim * 8 // 3, self.RoPE, dropout)
               for _ in range(3)]
         )
-        self.output_head = MultiTaskOutputHead(hidden_dim)
+        self.output_head = WindowTotalOutputHead(hidden_dim)
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, loss_start: int = 8) -> dict[str, torch.Tensor]:
         x = self.inst_encoder(x)
         x = self.layers(x)
-        return self.output_head(x)
+        return self.output_head(x, loss_start)
